@@ -5,6 +5,7 @@ import type {
   SourceSufficiencyResult,
 } from '../schemas.ts'
 import type { KnowledgeSearchResult } from '../retrieval/retriever.ts'
+import { inferAuditFramework } from '../auditResearch.ts'
 
 const PRIMARY = new Set(['primary_authority', 'official_guidance', 'professional_standard'])
 
@@ -14,7 +15,8 @@ export function classifyResearchContext(question: string): AccountingResearchCon
 
   let category: AccountingResearchContext['category'] = 'unknown'
   if (/(tax|irs|macrs|§|section 179|depreciat)/.test(q)) category = 'tax'
-  else if (/(audit|pcaob|aicpa|as\s?\d)/.test(q)) category = 'audit'
+  else if (/(audit|pcaob|aicpa|as\s?\d|gaas|au-?c|inventory\s+count|scope\s+limitation|disclaimer|qualified\s+opinion)/.test(q))
+    category = 'audit'
   else if (/(gaap|asc|ifrs|financial statement|ppe)/.test(q)) category = 'financial_accounting'
   else if (/(budget|managerial|cost accounting)/.test(q)) category = 'managerial_accounting'
   else if (/(sec|regulation|regulator)/.test(q)) category = 'regulatory'
@@ -23,7 +25,7 @@ export function classifyResearchContext(question: string): AccountingResearchCon
   const applicableYear = yearMatch ? Number(yearMatch[1]) : undefined
 
   let jurisdiction: string | undefined
-  if (/us[- ]?federal|federal|irs/.test(q)) jurisdiction = 'US-federal'
+  if (/us[- ]?federal|federal|irs|united\s+states|\bu\.?s\.?\b/.test(q)) jurisdiction = 'US-federal'
   else if (/state/.test(q) && !/statement/.test(q)) jurisdiction = undefined
 
   let bookOrTax: AccountingResearchContext['bookOrTax'] = 'unknown'
@@ -31,9 +33,13 @@ export function classifyResearchContext(question: string): AccountingResearchCon
   else if (/\btax\b/.test(q) && !/\bbook\b/.test(q)) bookOrTax = 'tax'
   else if (/\bbook\b/.test(q) && !/\btax\b/.test(q)) bookOrTax = 'book'
 
-  let auditFramework: string | undefined
-  if (/pcaob/.test(q)) auditFramework = 'PCAOB'
-  if (/aicpa/.test(q)) auditFramework = 'AICPA'
+  const auditInf = inferAuditFramework(question)
+  let auditFramework: string | undefined = auditInf.primary
+  // Explicit AICPA/PCAOB tokens still win if inference missed
+  if (/pcaob/.test(q) && !auditFramework) auditFramework = 'PCAOB'
+  if (/aicpa|au-?c|u\.?s\.?\s*gaas|\bgaas\b/.test(q) && auditInf.primary !== 'PCAOB') {
+    auditFramework = auditInf.primary ?? 'AICPA'
+  }
 
   let accountingFramework: string | undefined
   if (/gaap|asc/.test(q)) accountingFramework = 'US_GAAP'
@@ -57,17 +63,27 @@ export function classifyResearchContext(question: string): AccountingResearchCon
       material: true,
     })
   }
-  if (/depreciat|placed in service|macrs/.test(q) && !/20\d{2}-\d{2}-\d{2}|placed in service/.test(q)) {
-    // soft tip only if clearly asset dep without date words
-  }
 
   return {
     category,
-    topic: /depreciat/.test(q) ? 'depreciation' : undefined,
+    topic: /depreciat/.test(q)
+      ? 'depreciation'
+      : /inventory/.test(q)
+        ? 'inventory observation'
+        : category === 'audit'
+          ? 'audit procedures'
+          : undefined,
     applicableYear,
     jurisdiction,
     accountingFramework,
     auditFramework,
+    entityType:
+      auditInf.issuerStatus === 'nonissuer'
+        ? 'nonissuer'
+        : auditInf.issuerStatus === 'issuer'
+          ? 'issuer'
+          : undefined,
+    publicPrivateApplicability: auditInf.publicPrivate,
     bookOrTax,
     missingInformation: missing,
   }

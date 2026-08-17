@@ -19,6 +19,8 @@ import { getAllowlist, listSources, upsertSource } from './store/jsonStore.ts'
 
 beforeAll(async () => {
   process.env.CHAI_ADMIN_TOKEN = process.env.CHAI_ADMIN_TOKEN || 'test-admin'
+  process.env.CHAI_USE_MOCK_OFFICIAL = '1'
+  process.env.CHAI_ALLOW_DEMO_SOURCES = '1'
   await seedDemoKnowledgeIfEmpty(true)
 })
 
@@ -130,7 +132,7 @@ describe('research pipeline', () => {
       question: 'Explain MACRS five-year property depreciation.',
     })
     expect(result.unableToConclude).toBe(true)
-    expect(result.explanation).toMatch(/sufficient authoritative support/i)
+    expect(result.explanation).toMatch(/more information|authoritative/i)
   })
 
   it('concludes with approved IRS demo for 2025', async () => {
@@ -140,7 +142,7 @@ describe('research pipeline', () => {
     })
     expect(result.unableToConclude).toBe(false)
     expect(result.citations.some((c) => c.quotedText?.includes('20.00%'))).toBe(true)
-    expect(result.usedMockRetrieval).toBe(true)
+    expect(result.usedMockRetrieval).toBe(false)
   })
 
   it('labels internal policy separately and does not treat as primary tax authority alone', async () => {

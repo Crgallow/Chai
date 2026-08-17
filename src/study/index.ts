@@ -44,7 +44,12 @@ export function buildQuickAnswerFromStudy(study: CPAStudyResponse): StructuredAn
       usedOfficialResearch: false,
       officialResearchDisclosed: false,
       confidence: {
-        level: study.evidenceConfidence.score >= 75 ? 'high' : study.evidenceConfidence.score >= 50 ? 'medium' : 'low',
+        level:
+          (study.evidenceConfidence?.score ?? 0) >= 75
+            ? 'high'
+            : (study.evidenceConfidence?.score ?? 0) >= 50
+              ? 'medium'
+              : 'low',
         reason: 'Advisory label only — use evidenceConfidence for the scored percentage.',
       },
       warnings: study.mockLabeled ? ['Mock/demo study response.'] : [],
@@ -75,10 +80,10 @@ export function buildQuickAnswerFromStudy(study: CPAStudyResponse): StructuredAn
         applicableYear: c.applicableYear,
       })),
       sourceSufficiency: {
-        sufficient: study.evidenceConfidence.score >= 60,
-        score: study.evidenceConfidence.score / 100,
-        deficiencies: study.evidenceConfidence.deficiencies,
-        reasons: study.evidenceConfidence.reasons,
+        sufficient: (study.evidenceConfidence?.score ?? 0) >= 60,
+        score: (study.evidenceConfidence?.score ?? 0) / 100,
+        deficiencies: study.evidenceConfidence?.deficiencies ?? [],
+        reasons: study.evidenceConfidence?.reasons ?? [],
         requiresHumanReview: study.requiresProfessionalReview,
       },
     },
@@ -99,7 +104,7 @@ export function buildMockAgentResult(
       content: [
         structured.quickAnswer?.answer ?? study.conceptTested,
         structured.quickAnswer?.explanation,
-        `Evidence confidence: ${study.evidenceConfidence.score}% (${study.evidenceConfidence.label}).`,
+        `Evidence confidence: ${study.evidenceConfidence?.score ?? 0}% (${study.evidenceConfidence?.label ?? 'n/a'}).`,
         'Expand into Professional or CPA Exam Study mode for full teaching detail.',
         '[Mock response — OPENAI_API_KEY not configured]',
       ]
@@ -143,7 +148,7 @@ export function buildMockAgentResult(
         `Testing: ${study.conceptTested}`,
         `Rule: ${study.ruleToRemember}`,
         `Exam section: ${study.examSection ?? 'n/a'} · Topic: ${study.topic}`,
-        `Evidence confidence: ${study.evidenceConfidence.score}% · Source quality: ${study.sourceQuality.score}%`,
+        `Evidence confidence: ${study.evidenceConfidence?.score ?? 0}% · Source quality: ${study.sourceQuality?.score ?? 0}%`,
       ].join('\n\n'),
       structured,
     }
@@ -160,7 +165,7 @@ export function buildMockAgentResult(
       study.missingInformation.length
         ? `Missing information: ${study.missingInformation.map((m) => m.field).join(', ')}`
         : undefined,
-      `Evidence confidence: ${study.evidenceConfidence.score}% (${study.evidenceConfidence.label}).`,
+      `Evidence confidence: ${study.evidenceConfidence?.score ?? 0}% (${study.evidenceConfidence?.label ?? 'n/a'}).`,
       '[Mock response — OPENAI_API_KEY not configured]',
     ]
       .filter(Boolean)

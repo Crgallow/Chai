@@ -72,12 +72,15 @@ function Breakdown({ evidence }: { evidence: EvidenceConfidenceResult }) {
 }
 
 export function SourcesAndConfidence({ structured }: SourcesAndConfidenceProps) {
-  const evidence = structured.evidenceConfidence
-  const sourceQuality = structured.sourceQuality
+  const isStudy = structured.responseMode === 'cpa_exam_study'
+  const evidence = isStudy ? undefined : structured.evidenceConfidence
+  const sourceQuality = isStudy ? undefined : structured.sourceQuality
   const [showWhy, setShowWhy] = useState(false)
-  const [showSources, setShowSources] = useState(false)
+  const [showSources, setShowSources] = useState(true)
 
-  if (!evidence && !sourceQuality && !structured.research) return null
+  if (!evidence && !sourceQuality && !structured.research && !structured.cpaStudy?.citations?.length) {
+    return null
+  }
 
   const citations = structured.cpaStudy?.citations ??
     structured.research?.citations.map((c) => ({
@@ -108,7 +111,7 @@ export function SourcesAndConfidence({ structured }: SourcesAndConfidenceProps) 
 
   return (
     <section className="sources-confidence">
-      <h3>Sources and Confidence</h3>
+      <h3>{isStudy ? 'Citations' : 'Sources and Confidence'}</h3>
       {evidence && (
         <div className="score-row">
           <ScoreMeter
@@ -133,30 +136,40 @@ export function SourcesAndConfidence({ structured }: SourcesAndConfidenceProps) 
           title="source quality"
         />
       )}
-      <ul className="validation-list score-meta">
-        <li>
-          Sources used: {sourceQuality?.sourcesEvaluated ?? citations.length}
-          {sourceQuality != null && (
-            <>
-              {' '}
-              · Primary {sourceQuality.primarySources} · Secondary {sourceQuality.secondarySources}
-            </>
+      {!isStudy && (
+        <ul className="validation-list score-meta">
+          <li>
+            Sources used: {sourceQuality?.sourcesEvaluated ?? citations.length}
+            {sourceQuality != null && (
+              <>
+                {' '}
+                · Primary {sourceQuality.primarySources} · Secondary {sourceQuality.secondarySources}
+              </>
+            )}
+          </li>
+          {calcPassed != null && (
+            <li>Calculations validation: {calcPassed ? 'passed' : 'failed / incomplete'}</li>
           )}
-        </li>
-        {calcPassed != null && (
-          <li>Calculations validation: {calcPassed ? 'passed' : 'failed / incomplete'}</li>
-        )}
-        <li>Material facts missing: {missingFacts ? 'yes' : 'no'}</li>
-        <li>
-          Professional review recommended:{' '}
-          {evidence?.requiresProfessionalReview || structured.research?.requiresProfessionalReview
-            ? 'yes'
-            : 'no'}
-        </li>
-      </ul>
-      <p className="field-hint">
-        Evidence confidence is not a statistical probability that the answer is correct.
-      </p>
+          <li>Material facts missing: {missingFacts ? 'yes' : 'no'}</li>
+          <li>
+            Professional review recommended:{' '}
+            {evidence?.requiresProfessionalReview || structured.research?.requiresProfessionalReview
+              ? 'yes'
+              : 'no'}
+          </li>
+        </ul>
+      )}
+      {isStudy && (
+        <p className="field-hint">
+          Study these citations with the tutor explanation above. Chai does not show a probability that
+          the answer is correct.
+        </p>
+      )}
+      {!isStudy && (
+        <p className="field-hint">
+          Evidence confidence is not a statistical probability that the answer is correct.
+        </p>
+      )}
       {evidence && (
         <button type="button" className="text-btn" onClick={() => setShowWhy((v) => !v)}>
           {showWhy ? 'Hide' : 'Why is the score'} {evidence.score}%?
@@ -171,9 +184,11 @@ export function SourcesAndConfidence({ structured }: SourcesAndConfidenceProps) 
       )}
       {citations.length > 0 && (
         <>
-          <button type="button" className="text-btn" onClick={() => setShowSources((v) => !v)}>
-            {showSources ? 'Hide source cards' : 'Show source cards'}
-          </button>
+          {!isStudy && (
+            <button type="button" className="text-btn" onClick={() => setShowSources((v) => !v)}>
+              {showSources ? 'Hide source cards' : 'Show source cards'}
+            </button>
+          )}
           {showSources && (
             <div className="citation-list">
               {citations.map((c, i) => (
@@ -197,16 +212,22 @@ export function SourcesAndConfidence({ structured }: SourcesAndConfidenceProps) 
                   )}
                   {(c.applicableYear || c.jurisdiction || c.effectiveDate) && (
                     <p className="field-hint">
-                      {c.applicableYear ? `Year ${c.applicableYear}` : ''}
-                      {c.jurisdiction ? ` · ${c.jurisdiction}` : ''}
-                      {c.effectiveDate ? ` · effective ${c.effectiveDate}` : ''}
+                      {[
+                        c.applicableYear ? `Year ${c.applicableYear}` : null,
+                        c.jurisdiction,
+                        c.effectiveDate ? `eff. ${c.effectiveDate}` : null,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
                     </p>
                   )}
-                  {c.excerpt && <blockquote className="doc-quote">“{c.excerpt}”</blockquote>}
+                  {c.excerpt && <p>{c.excerpt}</p>}
                   {c.location && (
-                    <a href={c.location} target="_blank" rel="noreferrer">
-                      Source location
-                    </a>
+                    <p className="field-hint">
+                      <a href={c.location} target="_blank" rel="noreferrer">
+                        {c.location}
+                      </a>
+                    </p>
                   )}
                 </article>
               ))}

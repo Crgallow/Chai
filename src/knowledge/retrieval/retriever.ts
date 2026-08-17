@@ -4,6 +4,12 @@ import type {
   KnowledgeSource,
 } from '../schemas.ts'
 import { listChunks, listSources } from '../store/jsonStore.ts'
+import {
+  isAuditCategorySource,
+  isIrrelevantStatuteForAudit,
+  scoreAuditPassageRelevance,
+  tokenizeForAuditSearch,
+} from '../auditResearch.ts'
 
 export interface AccountingResearchQuery {
   searchTerms: string
@@ -19,6 +25,8 @@ export interface AccountingResearchQuery {
   organizationId?: string
   includeExcludedStatuses?: boolean
   allowHistoricalSuperseded?: boolean
+  /** Original user question — used for relevance / USC blocking */
+  originalQuestion?: string
 }
 
 export interface KnowledgeSearchResult {
@@ -33,10 +41,7 @@ export interface AccountingKnowledgeRetriever {
 }
 
 function tokenize(s: string): string[] {
-  return s
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length > 1)
+  return tokenizeForAuditSearch(s)
 }
 
 function scoreText(hay: string, terms: string[]): number {
@@ -79,7 +84,6 @@ function isRetrievable(
     return { ok: false, reason: 'org isolation' }
   }
   if (query.taxYear && source.taxYear && source.taxYear !== query.taxYear) {
-    // Allow undated sources; exclude wrong year
     return { ok: false, reason: 'year mismatch' }
   }
   if (
@@ -89,7 +93,6 @@ function isRetrievable(
     query.jurisdiction.toLowerCase() !== 'us-federal' &&
     source.jurisdiction.toLowerCase() !== 'us-federal'
   ) {
-    // soft: if both set and clearly incompatible
     if (
       source.jurisdiction.toLowerCase() !== query.jurisdiction.toLowerCase() &&
       !source.jurisdiction.toLowerCase().includes('us')
@@ -104,12 +107,43 @@ function isRetrievable(
   ) {
     return { ok: false, reason: 'framework mismatch' }
   }
-  if (query.auditFramework && source.auditFramework && source.auditFramework !== query.auditFramework) {
-    return { ok: false, reason: 'audit framework mismatch' }
+
+  if (query.category === 'audit' || query.auditFramework) {
+    if (
+      isIrrelevantStatuteForAudit({
+        question: query.originalQuestion || query.searchTerms,
+        sourceTitle: source.title,
+        publisher: source.publisher,
+        category: source.category,
+        auditFramework: source.auditFramework,
+      })
+    ) {
+      return { ok: false, reason: 'irrelevant statute for audit procedure question' }
+    }
+    if (query.auditFramework) {
+      if (source.auditFramework && source.auditFramework !== query.auditFramework) {
+        return { ok: false, reason: 'audit framework mismatch' }
+      }
+      if (!source.auditFramework && !isAuditCategorySource(source)) {
+        return { ok: false, reason: 'not an audit-standards source' }
+      }
+    } else if (query.category === 'audit' && source.category && source.category !== 'audit') {
+      if (!isAuditCategorySource(source)) {
+        return { ok: false, reason: 'wrong category for audit research' }
+      }
+    }
   }
-  if (query.category && source.category !== query.category) {
-    // allow regulatory cross-read lightly by not hard-failing unknown
+
+  if (
+    query.publicPrivateApplicability &&
+    source.publicPrivateApplicability &&
+    source.publicPrivateApplicability !== 'both' &&
+    source.publicPrivateApplicability !== 'not_applicable' &&
+    source.publicPrivateApplicability !== query.publicPrivateApplicability
+  ) {
+    return { ok: false, reason: 'public/private applicability mismatch' }
   }
+
   return { ok: true }
 }
 
@@ -119,20 +153,32 @@ export class MockLocalKnowledgeRetriever implements AccountingKnowledgeRetriever
     const terms = tokenize(query.searchTerms)
     const byId = new Map(sources.map((s) => [s.id, s]))
     const results: KnowledgeSearchResult[] = []
+    const isAudit = Boolean(query.category === 'audit' || query.auditFramework)
 
     for (const chunk of chunks) {
       const source = byId.get(chunk.sourceId)
       if (!source) continue
       const gate = isRetrievable(source, query)
       if (!gate.ok) continue
-      const score =
-        scoreText(`${source.title} ${source.publisher} ${source.topic ?? ''} ${chunk.text}`, terms) +
-        (query.topic && source.topic?.toLowerCase().includes(query.topic.toLowerCase()) ? 0.2 : 0)
-      if (score <= 0) continue
+      const hay = `${source.title} ${source.publisher} ${source.topic ?? ''} ${chunk.text}`
+      let score = isAudit
+        ? scoreAuditPassageRelevance(chunk.text, query.searchTerms, {
+            title: source.title,
+            publisher: source.publisher,
+            auditFramework: source.auditFramework,
+          })
+        : scoreText(hay, terms)
+      if (query.topic && source.topic?.toLowerCase().includes(query.topic.toLowerCase())) {
+        score += 0.2
+      }
+      if (query.auditFramework && source.auditFramework === query.auditFramework) {
+        score += 0.25
+      }
+      if (score <= 0.12) continue
       results.push({ source, chunk, score, retrievalMode: 'mock_local' })
     }
 
-    return results.sort((a, b) => b.score - a.score).slice(0, 12)
+    return results.sort((a, b) => b.score - a.score).slice(0, 16)
   }
 }
 
@@ -140,6 +186,7 @@ export function contextToQuery(
   context: AccountingResearchContext,
   searchTerms: string,
   organizationId?: string,
+  originalQuestion?: string,
 ): AccountingResearchQuery {
   return {
     searchTerms,
@@ -153,5 +200,6 @@ export function contextToQuery(
     publicPrivateApplicability: context.publicPrivateApplicability,
     organizationId,
     allowHistoricalSuperseded: Boolean(context.applicableYear),
+    originalQuestion,
   }
 }

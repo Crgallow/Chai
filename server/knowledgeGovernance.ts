@@ -27,8 +27,6 @@ import {
 } from '../src/knowledge/store/jsonStore.ts'
 import { runControlledResearch } from '../src/knowledge/researchPipeline.ts'
 import { MockLocalKnowledgeRetriever } from '../src/knowledge/retrieval/retriever.ts'
-import { seedDemoKnowledgeIfEmpty } from '../src/knowledge/mock/seed.ts'
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const upload = multer({
   dest: path.resolve(__dirname, '../data/tmp'),
@@ -66,21 +64,23 @@ export function registerKnowledgeGovernanceRoutes(app: Express): void {
   fs.mkdirSync(path.resolve(__dirname, '../data/tmp'), { recursive: true })
 
   app.get('/api/knowledge/health', async (_req, res) => {
-    await seedDemoKnowledgeIfEmpty().catch(() => undefined)
     const sources = await listSources()
+    const live = sources.filter((s) => !s.id.startsWith('ks_demo_'))
     res.json({
       ok: true,
       adminConfigured: Boolean(process.env.CHAI_ADMIN_TOKEN?.trim()),
-      sourceCount: sources.length,
-      retrievalProvider: 'mock_local',
-      officialResearchProvider: process.env.OFFICIAL_RESEARCH_PROVIDER || 'mock',
+      sourceCount: live.length,
+      demoSourcesExcluded: sources.length - live.length,
+      retrieval: 'local_corpus',
+      officialResearch: process.env.CHAI_USE_MOCK_OFFICIAL === '1' ? 'mock_test' : 'openai_web_search',
+      openAiConfigured: Boolean(process.env.OPENAI_API_KEY?.trim()),
     })
   })
 
   app.get('/api/knowledge/sources', async (req, res) => {
     try {
-      await seedDemoKnowledgeIfEmpty()
       let sources = await listSources()
+      sources = sources.filter((s) => !s.id.startsWith('ks_demo_'))
       const q = String(req.query.q || '').toLowerCase()
       const status = req.query.status ? String(req.query.status) : ''
       if (status) sources = sources.filter((s) => s.status === status)
@@ -92,7 +92,7 @@ export function registerKnowledgeGovernanceRoutes(app: Express): void {
             (s.topic || '').toLowerCase().includes(q),
         )
       }
-      res.json({ sources, mockRetrieval: true })
+      res.json({ sources, mockRetrieval: false })
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : 'List failed' })
     }

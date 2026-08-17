@@ -1,18 +1,18 @@
 import type { Message, ModelId, StructuredAnswer } from '../src/types.ts'
 import type { ResponseMode, StudyPreference } from '../src/study/schemas.ts'
 import { attachDeterministicScores } from '../src/scoring/attach.ts'
-import { buildMockAgentResult, snapshotScoreMeta } from '../src/study/index.ts'
+import { snapshotScoreMeta } from '../src/study/index.ts'
 import { ensureCPAStudyStructured } from '../src/study/ensureStudy.ts'
 import { runAccountingResearchWorkflow } from './research/runResearch.ts'
 import type { ResearchProgressEvent, ResearchRun } from '../src/research/schemas.ts'
 import { setDocumentSearchHandler, setKnowledgeResearchHandler } from '../src/accounting/tools.ts'
 import { searchDocuments } from './documents.ts'
 import { runControlledResearch } from '../src/knowledge/researchPipeline.ts'
-import { seedDemoKnowledgeIfEmpty } from '../src/knowledge/mock/seed.ts'
+import { isAccountingResearchQuestion } from './intent.ts'
+import { createConversationalReply } from './chat/conversational.ts'
 
 setDocumentSearchHandler(searchDocuments)
 setKnowledgeResearchHandler(async (question) => {
-  await seedDemoKnowledgeIfEmpty()
   const research = await runControlledResearch({ question, organizationId: 'platform', actor: 'agent' })
   return {
     conclusion: research.conclusion,
@@ -56,6 +56,12 @@ function lastUserQuestion(history: Message[]): string {
   return history[history.length - 1]?.content ?? ''
 }
 
+function requireOpenAiKey(): void {
+  if (!process.env.OPENAI_API_KEY?.trim()) {
+    throw new Error('OPENAI_API_KEY is required. Add it to your .env to use Chai.')
+  }
+}
+
 function structuredFromResearchRun(run: ResearchRun, content: string): StructuredAnswer {
   const researchView =
     run.primarySources.length || run.secondarySources.length || run.status === 'blocked'
@@ -64,14 +70,14 @@ function structuredFromResearchRun(run: ResearchRun, content: string): Structure
           explanation: content,
           unableToConclude: run.insufficientAuthority || run.status === 'blocked',
           requiresProfessionalReview: true,
-          usedMockRetrieval: run.usedMockProvider,
+          usedMockRetrieval: false,
           usedOfficialResearch: run.stages.some((s) =>
-            s.toolCalls.some((t) => t.name.includes('official')),
+            s.toolCalls.some((t) => t.name.includes('official') || t.name.includes('web')),
           ),
           officialResearchDisclosed: true,
           confidence: {
             level: run.insufficientAuthority ? ('low' as const) : ('medium' as const),
-            reason: 'Advisory only — evidence confidence is calculated separately.',
+            reason: 'Advisory only — not a probability of correctness.',
           },
           warnings: run.stages.flatMap((s) => s.warnings),
           factsReliedUpon: run.facts?.userProvidedFacts ?? [],
@@ -144,8 +150,8 @@ export interface AgentOptions {
 }
 
 /**
- * Primary path: enforced accounting research state machine.
- * Uses OpenAI Responses API (store:false) when OPENAI_API_KEY is set for structured stages.
+ * Conversational chat for non-accounting messages.
+ * Accounting questions use the research pipeline + authoritative corpus (web fallback if needed).
  */
 export async function runAccountingAgent(
   history: Message[],
@@ -153,20 +159,20 @@ export async function runAccountingAgent(
   signal?: AbortSignal,
   options: AgentOptions = {},
 ): Promise<AgentResult> {
+  requireOpenAiKey()
+
   const mode = options.mode ?? 'professional'
   const studyPreference = options.studyPreference
   const question = lastUserQuestion(history)
 
-  if (mode === 'cpa_exam_study' && !process.env.OPENAI_API_KEY?.trim()) {
-    const mock = buildMockAgentResult(history, mode, studyPreference)
-    return {
-      content: mock.content,
-      structured: snapshotScoreMeta({
-        ...mock.structured,
-        responseMode: mode,
-        studyPreference,
-      }),
-    }
+  if (!isAccountingResearchQuestion(question)) {
+    return createConversationalReply({
+      history,
+      model,
+      mode,
+      studyPreference,
+      signal,
+    })
   }
 
   const { run, content } = await runAccountingResearchWorkflow({
@@ -183,6 +189,13 @@ export async function runAccountingAgent(
 
   if (mode === 'cpa_exam_study') {
     structured = snapshotScoreMeta(ensureCPAStudyStructured(structured, content, studyPreference))
+    // Study mode: citations + deep teaching, no probability meters.
+    delete structured.evidenceConfidence
+    delete structured.sourceQuality
+    if (structured.cpaStudy) {
+      const { evidenceConfidence: _e, sourceQuality: _s, ...rest } = structured.cpaStudy
+      structured.cpaStudy = rest
+    }
   }
   if (mode === 'quick_answer') {
     structured.quickAnswer = {

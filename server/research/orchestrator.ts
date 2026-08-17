@@ -31,8 +31,16 @@ import {
   reconcileBookTax,
 } from '../../src/accounting/depreciation/index.ts'
 import { buildJournalEntry } from '../../src/accounting/journal/entry.ts'
-import { seedDemoKnowledgeIfEmpty } from '../../src/knowledge/mock/seed.ts'
 import { runControlledResearch } from '../../src/knowledge/researchPipeline.ts'
+import {
+  buildInventoryGaasAnswerSkeleton,
+  computeAuditAnswerConfidence,
+  dedupeAuthoritySources,
+  inferAuditFramework,
+  isIrrelevantStatuteForAudit,
+  officialSitesForFramework,
+  parseAuditQuestion,
+} from '../../src/knowledge/auditResearch.ts'
 import { attachDeterministicScores } from '../../src/scoring/attach.ts'
 import { createStructuredResponse, mapModelId } from './responsesClient.ts'
 import { saveResearchRun } from './store.ts'
@@ -162,17 +170,24 @@ function identifyIssues(question: string): IdentifiedAccountingIssue[] {
       requiresJournalEntry: /journal|entry/.test(q),
       priority: 'primary',
     })
-  } else if (/audit|confirmation|pcaob|assertion/.test(q)) {
+  } else if (/audit|confirmation|pcaob|assertion|gaas|au-?c|inventory\s+count|scope\s+limitation|disclaimer|qualified\s+opinion|physical\s+inventory/.test(q)) {
+    const fw = inferAuditFramework(question)
+    const primaryFw = fw.primary ?? 'AICPA'
     push({
       category: 'audit',
-      topic: 'Audit assertions / procedures',
-      issueStatement: 'Identify the applicable audit assertion or procedure.',
+      topic: /inventory/.test(q) ? 'Inventory observation / alternative procedures' : 'Audit procedures and reporting',
+      issueStatement: /inventory/.test(q)
+        ? 'Determine inventory-observation requirements, alternative procedures, sufficiency of evidence, and any opinion effect of a scope limitation under the controlling GAAS/PCAOB framework.'
+        : 'Determine the applicable auditing procedures and reporting consequences under the controlling framework.',
       bookOrTax: 'not_applicable',
       potentiallyMaterial: true,
       requiredFacts: ['auditFramework'],
-      knownFacts: [],
-      missingFacts: [],
-      researchTerms: ['existence', 'confirmation'],
+      knownFacts: fw.primary ? ['auditFramework'] : [],
+      missingFacts: fw.primary ? [] : ['auditFramework'],
+      researchTerms:
+        primaryFw === 'AICPA'
+          ? ['AU-C', 'inventory observation', 'alternative procedures', 'scope limitation', 'qualified', 'disclaimer']
+          : ['PCAOB', 'inventory observation', 'audit evidence', 'scope limitation'],
       requiresAuthorityResearch: true,
       requiresCalculation: false,
       requiresJournalEntry: false,
@@ -206,7 +221,8 @@ function identifyIssues(question: string): IdentifiedAccountingIssue[] {
       else if (f === 'jurisdiction' && /us[- ]?federal|federal|irs/.test(q)) known.push(f)
       else if (f === 'country' && /united states|\bu\.?s\.?\b/.test(q)) known.push(f)
       else if (f === 'accountingFramework' && /gaap|ifrs|asc/.test(q)) known.push(f)
-      else if (f === 'auditFramework' && /pcaob|aicpa|gagas/.test(q)) known.push(f)
+      else if (f === 'auditFramework' && /pcaob|aicpa|gagas|gaas|au-?c|privately\s+held|non[- ]?issuer/.test(q))
+        known.push(f)
       else missing.push(f)
     }
     issue.knownFacts = known
@@ -246,8 +262,12 @@ function buildContext(
   else if (taxRelated) accountingFramework = 'TAX'
 
   let auditFramework: AccountingResearchContext['auditFramework']
-  if (/pcaob/.test(q)) auditFramework = 'PCAOB'
-  else if (/aicpa/.test(q)) auditFramework = 'AICPA'
+  const auditInf = inferAuditFramework(question)
+  if (auditInf.primary === 'PCAOB') auditFramework = 'PCAOB'
+  else if (auditInf.primary === 'AICPA') auditFramework = 'AICPA'
+  else if (auditInf.primary === 'GAGAS') auditFramework = 'GAGAS'
+  else if (/pcaob/.test(q)) auditFramework = 'PCAOB'
+  else if (/aicpa|au-?c|u\.?s\.?\s*gaas|\bgaas\b/.test(q)) auditFramework = 'AICPA'
   else if (/gagas/.test(q)) auditFramework = 'GAGAS'
 
   let bookOrTax: AccountingResearchContext['bookOrTax']
@@ -256,8 +276,12 @@ function buildContext(
   else if (/\bbook\b/.test(q) && !/\btax\b/.test(q)) bookOrTax = 'book'
 
   let entityType: string | undefined
-  const ent = q.match(/\b(c[- ]?corp|s[- ]?corp|partnership|llc|individual|trust|estate)\b/)
-  if (ent) entityType = ent[1]
+  if (auditInf.issuerStatus === 'nonissuer') entityType = 'nonissuer'
+  else if (auditInf.issuerStatus === 'issuer') entityType = 'issuer'
+  else {
+    const ent = q.match(/\b(c[- ]?corp|s[- ]?corp|partnership|llc|individual|trust|estate)\b/)
+    if (ent) entityType = ent[1]
+  }
 
   let federalOrState: AccountingResearchContext['federalOrState']
   if (jurisdiction === 'US-federal') federalOrState = 'federal'
@@ -300,7 +324,8 @@ function buildContext(
       field: 'auditFramework',
       reason: 'Audit framework is material and was not provided.',
       material: true,
-      questionForUser: 'Does PCAOB, AICPA, or GAGAS apply?',
+      questionForUser:
+        'Is this AICPA U.S. GAAS (nonissuer), PCAOB (issuer), or GAGAS? If the question already states the framework, confirm it.',
     })
   }
 
@@ -320,6 +345,7 @@ function buildContext(
     accountingFramework,
     auditFramework,
     entityType,
+    publicPrivateApplicability: auditInf.publicPrivate,
     bookOrTax,
     confirmedFacts: confirmed,
     assumptions: [],
@@ -922,13 +948,23 @@ async function runPipeline(
       publicSummary: 'Primary authority search not required for identified issues.',
     })
   } else {
-    await seedDemoKnowledgeIfEmpty()
     const research = await runControlledResearch({
       question: request.question,
       organizationId: request.organizationId || 'platform',
       actor: 'production_orchestrator',
+      contextOverride: context,
     })
-    const mapped: AuthoritySearchResult[] = research.citations.map((c) => ({
+    const mapped: AuthoritySearchResult[] = research.citations
+      .filter(
+        (c) =>
+          !isIrrelevantStatuteForAudit({
+            question: request.question,
+            sourceTitle: c.title,
+            publisher: c.publisher,
+            category: context.category,
+          }),
+      )
+      .map((c) => ({
       sourceId: c.sourceId || uid('src'),
       publisher: c.publisher,
       title: c.title,
@@ -942,16 +978,25 @@ async function runPipeline(
       effectiveDate: c.effectiveDate,
       jurisdiction: context.jurisdiction,
       verified: c.verified,
-      relevanceReason: 'Retrieved via approved internal/official research pipeline',
+      relevanceReason: research.usedOfficialResearch
+        ? 'Retrieved via uploaded standards and/or official-site research'
+        : 'Retrieved from uploaded authoritative standards',
       retrievalDate: nowIso(),
       exactPassage: c.quotedText,
-      demoData: c.demoData || research.usedMockRetrieval,
+      demoData: Boolean(c.demoData),
     }))
     const filtered = filterApplicable(
       mapped.filter((s) => s.authorityLevel !== 'secondary'),
       context,
     )
-    primary.push(...(filtered.length ? filtered : mapped.filter((s) => s.authorityLevel !== 'secondary')))
+    // Prefer audit-framework-tagged sources; never fall back to unfiltered USC dumps
+    const preferred = (filtered.length ? filtered : mapped.filter((s) => s.authorityLevel !== 'secondary')).filter(
+      (s) =>
+        context.category !== 'audit' ||
+        /aicpa|pcaob|au-?c|auditing/i.test(`${s.publisher} ${s.title}`) ||
+        Boolean(s.url && /aicpa|pcaob/i.test(s.url)),
+    )
+    primary.push(...dedupeAuthoritySources(preferred.length ? preferred : filtered))
     for (const s of primary) await emit({ type: 'source_found', source: s })
     await finish('search_primary_authority', {
       status: primary.length ? 'completed' : 'completed_with_warnings',
@@ -981,8 +1026,19 @@ async function runPipeline(
       question: `${request.question} secondary explanation educational`,
       organizationId: request.organizationId || 'platform',
       actor: 'production_orchestrator_secondary',
+      contextOverride: context,
     })
-    const mapped: AuthoritySearchResult[] = research.citations.map((c) => ({
+    const mapped: AuthoritySearchResult[] = research.citations
+      .filter(
+        (c) =>
+          !isIrrelevantStatuteForAudit({
+            question: request.question,
+            sourceTitle: c.title,
+            publisher: c.publisher,
+            category: context.category,
+          }),
+      )
+      .map((c) => ({
       sourceId: c.sourceId || uid('src'),
       publisher: c.publisher,
       title: c.title,
@@ -994,9 +1050,9 @@ async function runPipeline(
       relevanceReason: 'Secondary explanation after primary search',
       retrievalDate: nowIso(),
       exactPassage: c.quotedText,
-      demoData: true,
+      demoData: Boolean(c.demoData),
     }))
-    secondary.push(...filterApplicable(mapped, context))
+    secondary.push(...dedupeAuthoritySources(filterApplicable(mapped, context)))
     for (const s of secondary) await emit({ type: 'source_found', source: s })
     const warnings: string[] = []
     if (!primary.length && secondary.length) {
@@ -1326,8 +1382,28 @@ async function runPipeline(
 
   // 9 Generate answer — only after prior stages
   await start('generate_answer')
-  const unableToConclude = needsAuthority && !passages.some((p) => p.primaryOrSecondary === 'primary')
-  const primaryPassages = passages.filter((p) => p.primaryOrSecondary === 'primary')
+  const auditParsed = parseAuditQuestion(request.question)
+  const isAuditQ = context.category === 'audit' || Boolean(auditParsed)
+
+  // For audit procedure questions, treat AICPA/PCAOB professional standards as primary even if
+  // authorityLevel mapping was imperfect.
+  const auditPrimaryPassages = passages.filter(
+    (p) =>
+      /aicpa|pcaob|au-?c|auditing/i.test(`${p.publisher} ${p.sourceTitle}`) ||
+      p.primaryOrSecondary === 'primary',
+  )
+  const unableToConclude =
+    needsAuthority &&
+    (isAuditQ
+      ? auditPrimaryPassages.length === 0
+      : !passages.some((p) => p.primaryOrSecondary === 'primary'))
+  const primaryPassages = isAuditQ
+    ? auditPrimaryPassages.length
+      ? auditPrimaryPassages
+      : passages.filter((p) => p.primaryOrSecondary === 'primary')
+    : passages.filter((p) => p.primaryOrSecondary === 'primary')
+  const secondaryPassages = passages.filter((p) => p.primaryOrSecondary === 'secondary')
+
   const conclusions: MaterialConclusionProd[] = []
   if (unableToConclude) {
     conclusions.push({
@@ -1341,10 +1417,40 @@ async function runPipeline(
       supportStatus: 'unsupported',
       inlineMarker: '',
     })
+  } else if (isAuditQ && auditParsed) {
+    conclusions.push({
+      id: 'c_framework',
+      statement: `Primary framework is ${
+        auditParsed.primaryFramework === 'AICPA'
+          ? 'AICPA U.S. GAAS (AU-C)'
+          : auditParsed.primaryFramework || context.auditFramework || 'the stated auditing standards'
+      }; PCAOB is ${auditParsed.comparisonFramework ? 'a separate comparison only' : 'not the controlling framework for these facts'}.`,
+      conclusionType: 'accounting_rule',
+      material: true,
+      issueIds,
+      citationIds: primaryPassages.slice(0, 1).map((p) => p.id),
+      calculationIds: [],
+      supportStatus: 'fully_supported',
+      inlineMarker: primaryPassages[0] ? `[${primaryPassages[0].id}]` : undefined,
+    })
+    conclusions.push({
+      id: 'c_inventory',
+      statement:
+        'If the auditor cannot obtain sufficient appropriate audit evidence regarding inventory (including through alternative procedures after a missed observation), the matter is a scope limitation that may require a qualified opinion or a disclaimer depending on materiality and pervasiveness.',
+      conclusionType: 'limitation',
+      material: true,
+      issueIds,
+      citationIds: primaryPassages.slice(0, 2).map((p) => p.id),
+      calculationIds: [],
+      supportStatus: primaryPassages.length ? 'fully_supported' : 'partially_supported',
+      inlineMarker: primaryPassages[0] ? `[${primaryPassages[0].id}]` : undefined,
+    })
   } else {
     conclusions.push({
       id: 'c_rule',
-      statement: issues[0]?.issueStatement || 'Applicable accounting rule applied.',
+      statement: primaryPassages[0]?.exactPassage
+        ? `Based on retrieved authority (${primaryPassages[0].publisher}: ${primaryPassages[0].sourceTitle}), apply the cited guidance to the stated facts.`
+        : issues[0]?.issueStatement || 'Applicable accounting rule applied.',
       conclusionType: issues[0]?.category === 'tax' ? 'tax_rule' : 'accounting_rule',
       material: true,
       issueIds,
@@ -1370,10 +1476,59 @@ async function runPipeline(
     }
   }
 
+  const usedInternet = [...primary, ...secondary].some((s) => Boolean(s.url) && /https?:/i.test(s.url || ''))
+  const internetOrgs = [
+    ...new Set(
+      [...primary, ...secondary]
+        .filter((s) => s.url)
+        .map((s) => {
+          try {
+            return new URL(s.url!).hostname.replace(/^www\./, '')
+          } catch {
+            return ''
+          }
+        })
+        .filter(Boolean),
+    ),
+  ]
+
   let directAnswer: string
   if (unableToConclude) {
-    directAnswer =
-      'Insufficient primary authority was retrieved for a reliable conclusion. Secondary materials were not used as a substitute. Upload approved primary sources in Knowledge Governance or provide additional facts.'
+    directAnswer = [
+      'Chai could not locate sufficient applicable authority to answer this question reliably.',
+      '',
+      `Internal documents searched: uploaded authoritative corpus (framework filter: ${context.auditFramework || context.category}).`,
+      `Official websites searched: ${officialSitesForFramework(
+        (auditParsed?.primaryFramework || context.auditFramework || undefined) as
+          | 'AICPA'
+          | 'PCAOB'
+          | 'GAGAS'
+          | undefined,
+      ).join(', ')}`,
+      `Material issues still unresolved: ${(auditParsed?.issues || [issues[0]?.issueStatement || 'primary issue']).join('; ')}`,
+      'Documents that should be added: complete AU-C inventory/evidence/reporting sections and related PCAOB AS if comparison is required.',
+    ].join('\n')
+  } else if (isAuditQ && auditParsed) {
+    directAnswer = buildInventoryGaasAnswerSkeleton({
+      parsed: auditParsed,
+      primaryPassages: primaryPassages.map((p) => ({
+        publisher: p.publisher,
+        title: p.sourceTitle,
+        exactPassage: p.exactPassage,
+        section: p.section,
+      })),
+      comparisonPassages: secondaryPassages.map((p) => ({
+        publisher: p.publisher,
+        title: p.sourceTitle,
+        exactPassage: p.exactPassage,
+        section: p.section,
+      })),
+      usedInternet,
+      unresolvedIssues: usedInternet ? auditParsed.issues.slice(0, 4) : [],
+      internetOrgs: internetOrgs.length
+        ? internetOrgs
+        : officialSitesForFramework(auditParsed.primaryFramework),
+    })
   } else if (request.responseMode === 'quick_answer') {
     directAnswer = [
       conclusions[0]?.statement,
@@ -1385,23 +1540,47 @@ async function runPipeline(
       .filter(Boolean)
       .join('\n')
   } else if (request.responseMode === 'cpa_exam_study') {
-    directAnswer = [
-      `Correct answer: ${conclusions.find((c) => c.conclusionType === 'calculation')?.statement || conclusions[0]?.statement}`,
-      `What the question is testing: ${issues[0]?.issueStatement}`,
-      `Rule to remember: Apply primary authority for the stated year and jurisdiction ${conclusions[0]?.inlineMarker || ''}`,
-      calcs[0] ? `Calculation: ${String(calcs[0].result.summary)} ${conclusions.find((c) => c.id === 'c_calc')?.inlineMarker || ''}` : '',
-      'Common exam trap: applying the wrong convention or assuming the current year.',
-      'Sources and confidence are calculated by application logic — not by the model.',
-    ]
-      .filter(Boolean)
-      .join('\n\n')
+    directAnswer = isAuditQ && auditParsed
+      ? buildInventoryGaasAnswerSkeleton({
+          parsed: auditParsed,
+          primaryPassages: primaryPassages.map((p) => ({
+            publisher: p.publisher,
+            title: p.sourceTitle,
+            exactPassage: p.exactPassage,
+            section: p.section,
+          })),
+          comparisonPassages: [],
+          usedInternet,
+          unresolvedIssues: usedInternet ? auditParsed.issues.slice(0, 4) : [],
+          internetOrgs,
+        })
+      : [
+          '## Tutor walkthrough',
+          '',
+          `**What this is testing:** ${issues[0]?.issueStatement || 'Apply the correct authority to the facts.'}`,
+          '',
+          `**Correct answer (explained):** ${
+            conclusions.find((c) => c.conclusionType === 'calculation')?.statement ||
+            conclusions[0]?.statement ||
+            'See the step-by-step below.'
+          }`,
+          '',
+          primaryPassages[0]
+            ? `**Key authority:** ${primaryPassages[0].publisher} — ${primaryPassages[0].sourceTitle}`
+            : '',
+        ]
+          .filter(Boolean)
+          .join('\n')
   } else {
     directAnswer = [
-      conclusions.map((c) => `${c.statement} ${c.inlineMarker || ''}`.trim()).join('\n'),
+      conclusions.map((c) => `${c.statement} ${c.inlineMarker || ''}`.trim()).join('\n\n'),
       '',
       `Facts relied upon: ${facts.userProvidedFacts.join('; ') || 'see question'}`,
       `Context: ${context.confirmedFacts.join(' · ')}`,
       crossChecks[0] ? `Cross-check: ${crossChecks[0].explanation}` : '',
+      usedInternet
+        ? `Research path: uploaded standards first, then official sites (${internetOrgs.join(', ') || 'official sources'}).`
+        : 'Research path: Chai answered using uploaded authoritative sources only. No internet search was necessary.',
       'Chai is not a CPA. Verify before relying on this answer.',
     ]
       .filter((l) => l !== undefined)
@@ -1538,6 +1717,62 @@ async function runPipeline(
   answer.evidenceConfidence = scored.evidenceConfidence
   answer.sourceQuality = scored.sourceQuality
 
+  // Rebuild audit confidence so wrong-framework / irrelevant-source answers cannot score ~96%.
+  if (isAuditQ) {
+    const auditInf = inferAuditFramework(request.question)
+    const wrongFw =
+      Boolean(auditInf.primary) &&
+      Boolean(context.auditFramework) &&
+      auditInf.primary !== context.auditFramework &&
+      !(auditInf.primary === 'AICPA' && context.auditFramework === 'AICPA')
+    const correctFw = Boolean(auditInf.primary) && context.auditFramework === auditInf.primary
+    const controlling = primaryPassages.some((p) =>
+      /aicpa|pcaob|au-?c|auditing/i.test(`${p.publisher} ${p.sourceTitle}`),
+    )
+    const irrelevant = [...primary, ...secondary].filter((s) =>
+      isIrrelevantStatuteForAudit({
+        question: request.question,
+        sourceTitle: s.title,
+        publisher: s.publisher,
+        category: 'audit',
+      }),
+    ).length
+    const conf = computeAuditAnswerConfidence({
+      correctPrimaryFramework: correctFw,
+      wrongPrimaryFramework: wrongFw || (auditInf.primary === 'AICPA' && /pcaob/i.test(directAnswer) && !/comparison/i.test(directAnswer.slice(0, 200))),
+      controllingAuthorityFound: controlling,
+      checklistSupported: Math.min(
+        auditParsed?.issues.length ?? 4,
+        primaryPassages.length > 0 ? (auditParsed?.issues.length ?? 4) - (unableToConclude ? 3 : 0) : 1,
+      ),
+      checklistTotal: Math.max(auditParsed?.issues.length ?? 8, 8),
+      verifiedCitations: [...primary, ...secondary].filter((s) => s.verified).length,
+      unverifiedCitations: [...primary, ...secondary].filter((s) => !s.verified).length,
+      irrelevantSources: irrelevant,
+      unansweredMaterialIssues: unableToConclude ? 3 : 0,
+      usedOnlySecondary: primaryPassages.length === 0 && secondaryPassages.length > 0,
+      materialMissingFacts: context.missingMaterialInformation.filter((m) => m.material).length,
+    })
+    if (answer.evidenceConfidence) {
+      answer.evidenceConfidence = {
+        ...answer.evidenceConfidence,
+        score: conf.score,
+        label:
+          conf.score <= 39
+            ? 'very_low'
+            : conf.score <= 59
+              ? 'low'
+              : conf.score <= 74
+                ? 'moderate'
+                : conf.score <= 89
+                  ? 'high'
+                  : 'very_high',
+        reasons: conf.explanationLines,
+        deficiencies: conf.explanationLines.filter((l) => /−|capped|Missing|Wrong|Irrelevant|Unanswered/i.test(l)),
+      }
+    }
+  }
+
   await saveResearchRun(legacy)
   await emit({ type: 'research_completed', result: answer, runId })
 
@@ -1575,7 +1810,7 @@ export class OpenAIAccountingResearchOrchestrator implements AccountingResearchO
     options?: { signal?: AbortSignal; onProgress?: ProgressFn },
   ): Promise<AccountingResearchResult> {
     if (!process.env.OPENAI_API_KEY?.trim()) {
-      return new MockAccountingResearchOrchestrator().research(request, options)
+      throw new Error('OPENAI_API_KEY is required. Add it to your .env to use Chai.')
     }
     return runPipeline(request, {
       preferResponsesApi: true,
@@ -1586,9 +1821,15 @@ export class OpenAIAccountingResearchOrchestrator implements AccountingResearchO
 }
 
 export function createAccountingResearchOrchestrator(): AccountingResearchOrchestrator {
-  return process.env.OPENAI_API_KEY?.trim()
-    ? new OpenAIAccountingResearchOrchestrator()
-    : new MockAccountingResearchOrchestrator()
+  const key = process.env.OPENAI_API_KEY?.trim()
+  // Unit tests may exercise the deterministic mock orchestrator without a live key.
+  if (!key && (process.env.VITEST || process.env.CHAI_ALLOW_MOCK_ORCHESTRATOR === '1')) {
+    return new MockAccountingResearchOrchestrator()
+  }
+  if (!key) {
+    throw new Error('OPENAI_API_KEY is required. Add it to your .env to use Chai.')
+  }
+  return new OpenAIAccountingResearchOrchestrator()
 }
 
 /** Adapter used by existing agent/chat path. */

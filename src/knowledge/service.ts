@@ -12,7 +12,6 @@ import {
   appendAudit,
   deleteSourceRecord,
   getSource,
-  listChunks,
   listChunksForSource,
   listSources,
   replaceChunksForSource,

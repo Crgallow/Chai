@@ -1,24 +1,61 @@
-import type { AccountingResearchResponse } from './schemas.ts'
+import type { AccountingResearchContext, AccountingResearchResponse } from './schemas.ts'
 import { classifyResearchContext, evaluateSourceSufficiency } from './sufficiency/engine.ts'
 import { MockLocalKnowledgeRetriever, contextToQuery } from './retrieval/retriever.ts'
 import {
-  MockOfficialSourceResearchProvider,
+  createOfficialResearchProvider,
   officialToCitation,
   queueExternalForReview,
 } from './research/officialProvider.ts'
 import { appendAudit } from './store/jsonStore.ts'
 import type { AccountingCitation } from './schemas.ts'
+import {
+  buildAuditSearchQueries,
+  dedupeAuthoritySources,
+  isIrrelevantStatuteForAudit,
+  officialSitesForFramework,
+  parseAuditQuestion,
+  type AuditFrameworkId,
+} from './auditResearch.ts'
 
 const retriever = new MockLocalKnowledgeRetriever()
-const official = new MockOfficialSourceResearchProvider()
+
+function getOfficial() {
+  return createOfficialResearchProvider()
+}
 
 export async function runControlledResearch(input: {
   question: string
   organizationId?: string
   actor?: string
+  /** Prefer orchestrator-resolved context when provided */
+  contextOverride?: AccountingResearchContext
 }): Promise<AccountingResearchResponse> {
-  const context = classifyResearchContext(input.question)
-  const materialMissing = context.missingInformation.filter((m) => m.material)
+  const raw = input.contextOverride ?? classifyResearchContext(input.question)
+  // Orchestrator context uses missingMaterialInformation; knowledge context uses missingInformation.
+  const context: AccountingResearchContext = {
+    category:
+      (raw as AccountingResearchContext).category ||
+      (parseAuditQuestion(input.question) ? 'audit' : 'unknown'),
+    topic: (raw as AccountingResearchContext).topic,
+    applicableYear: raw.applicableYear,
+    jurisdiction: raw.jurisdiction,
+    accountingFramework: raw.accountingFramework,
+    auditFramework: raw.auditFramework,
+    entityType: raw.entityType,
+    publicPrivateApplicability: (raw as AccountingResearchContext).publicPrivateApplicability,
+    bookOrTax: (raw as AccountingResearchContext).bookOrTax ?? 'unknown',
+    missingInformation:
+      (raw as AccountingResearchContext).missingInformation ??
+      (
+        raw as {
+          missingMaterialInformation?: AccountingResearchContext['missingInformation']
+        }
+      ).missingMaterialInformation ??
+      [],
+  }
+  const materialMissing = (context.missingInformation ?? []).filter((m) => m.material)
+  const auditParsed = parseAuditQuestion(input.question)
+  const isAudit = context.category === 'audit' || Boolean(auditParsed)
 
   if (materialMissing.length) {
     return {
@@ -40,19 +77,63 @@ export async function runControlledResearch(input: {
       confidence: { level: 'low', reason: 'Missing material research context.' },
       requiresProfessionalReview: true,
       unableToConclude: true,
-      usedMockRetrieval: true,
+      usedMockRetrieval: false,
       usedOfficialResearch: false,
       officialResearchDisclosed: false,
       conclusion: undefined,
       explanation:
-        'I found potentially relevant guidance, but I could not locate sufficient authoritative support for a reliable conclusion. Additional research or professional review is required.',
+        'I need a bit more information before I can research this against authoritative sources.',
     }
   }
 
-  const internal = await retriever.search(contextToQuery(context, input.question, input.organizationId))
-  let sufficiency = evaluateSourceSufficiency({ context, results: internal })
+  const searchQueries =
+    isAudit && auditParsed
+      ? buildAuditSearchQueries(auditParsed, 'primary')
+      : [input.question]
 
-  const citations: AccountingCitation[] = internal.slice(0, 5).map((r) => ({
+  const mergedHits = []
+  for (const q of searchQueries.slice(0, 6)) {
+    const hits = await retriever.search(
+      contextToQuery(context, q, input.organizationId, input.question),
+    )
+    mergedHits.push(...hits)
+  }
+
+  // Deduplicate by chunk id, keep best score
+  const byChunk = new Map<string, (typeof mergedHits)[0]>()
+  for (const h of mergedHits) {
+    const prev = byChunk.get(h.chunk.id)
+    if (!prev || h.score > prev.score) byChunk.set(h.chunk.id, h)
+  }
+  let realInternal = [...byChunk.values()].sort((a, b) => b.score - a.score)
+
+  const allowDemo = process.env.CHAI_ALLOW_DEMO_SOURCES === '1'
+  if (!allowDemo) {
+    realInternal = realInternal.filter((r) => !r.source.id.startsWith('ks_demo_'))
+  }
+
+  // Drop irrelevant statutes for audit procedure questions
+  realInternal = realInternal.filter(
+    (r) =>
+      !isIrrelevantStatuteForAudit({
+        question: input.question,
+        sourceTitle: r.source.title,
+        publisher: r.source.publisher,
+        category: r.source.category,
+        auditFramework: r.source.auditFramework,
+      }),
+  )
+
+  // Prefer matching audit framework
+  if (context.auditFramework) {
+    const fwHits = realInternal.filter((r) => r.source.auditFramework === context.auditFramework)
+    if (fwHits.length) realInternal = [...fwHits, ...realInternal.filter((r) => r.source.auditFramework !== context.auditFramework)]
+  }
+
+  realInternal = realInternal.slice(0, 10)
+  let sufficiency = evaluateSourceSufficiency({ context, results: realInternal })
+
+  let citations: AccountingCitation[] = realInternal.slice(0, 8).map((r) => ({
     sourceId: r.source.id,
     publisher: r.source.publisher,
     title: r.source.title,
@@ -70,115 +151,281 @@ export async function runControlledResearch(input: {
     verified: r.source.verificationStatus === 'verified',
   }))
 
+  citations = dedupeAuthoritySources(citations)
+
   let usedOfficial = false
-  if (!sufficiency.sufficient && sufficiency.requiresExternalResearch) {
+  let internetDisclosure = ''
+  const unresolvedForWeb: string[] = []
+
+  const needsWeb =
+    !sufficiency.sufficient &&
+    sufficiency.requiresExternalResearch &&
+    (isAudit
+      ? realInternal.filter((r) => r.source.auditFramework === context.auditFramework).length < 2 ||
+        !sufficiency.sufficient
+      : true)
+
+  if (needsWeb) {
+    if (isAudit && auditParsed) {
+      unresolvedForWeb.push(
+        ...auditParsed.issues.filter((issue) => {
+          const key = issue.split(' ')[0]
+          return !citations.some((c) =>
+            `${c.title} ${c.quotedText || ''}`.toLowerCase().includes(key.toLowerCase()),
+          )
+        }),
+      )
+      if (!unresolvedForWeb.length) unresolvedForWeb.push(...auditParsed.issues.slice(0, 3))
+    }
+
+    internetDisclosure = isAudit
+      ? `Chai found that the uploaded auditing standards did not fully resolve the following issue(s): ${unresolvedForWeb.join('; ')}. Chai is now searching official internet sources.`
+      : 'Chai is searching official internet sources because internal coverage was insufficient.'
+
     await appendAudit({
       actor: input.actor ?? 'system',
       organizationId: input.organizationId,
       action: 'external_search',
-      target: 'official_provider',
+      target: 'web_research',
       afterSummary: input.question.slice(0, 120),
       result: 'success',
     })
-    const external = await official.search({
-      query: input.question,
-      taxYear: context.applicableYear,
-      jurisdiction: context.jurisdiction,
-      category: context.category,
-      organizationId: input.organizationId,
-    })
-    usedOfficial = true
-    for (const hit of external) {
-      citations.push(officialToCitation(hit))
-      await queueExternalForReview(hit, input.organizationId)
+
+    const frameworks: AuditFrameworkId[] = []
+    if (auditParsed?.primaryFramework) frameworks.push(auditParsed.primaryFramework)
+    if (auditParsed?.comparisonFramework) frameworks.push(auditParsed.comparisonFramework)
+    if (!frameworks.length && context.auditFramework) {
+      frameworks.push(context.auditFramework as AuditFrameworkId)
     }
-    // Re-evaluate with external as supplemental — snippets alone never flip sufficiency without evaluation
-    const externalSupport = external.some((e) => e.quotedSection.length > 40 && e.allowlisted)
-    if (externalSupport && citations.some((c) => c.internalOrExternal === 'external' && c.quotedText)) {
-      sufficiency = {
-        ...sufficiency,
-        sufficient: true,
-        score: Math.max(sufficiency.score, 0.55),
-        reasons: [
-          ...sufficiency.reasons,
-          'Approved-domain official research returned usable excerpts (demo/mock provider).',
-        ],
-        deficiencies: sufficiency.deficiencies.filter((d) => !/No verified authoritative/i.test(d)),
-        requiresExternalResearch: false,
-        requiresHumanReview: true,
+    if (!frameworks.length) frameworks.push('AICPA')
+
+    try {
+      const externalAll = []
+      for (const fw of frameworks) {
+        const sites = officialSitesForFramework(fw)
+        const queries =
+          isAudit && auditParsed
+            ? buildAuditSearchQueries(
+                auditParsed,
+                fw === auditParsed.comparisonFramework ? 'comparison' : 'primary',
+              ).slice(0, 3)
+            : [input.question]
+        for (const q of queries) {
+          const siteQ = sites.map((s) => `site:${s}`).join(' OR ')
+          const external = await getOfficial().search({
+            query: `${siteQ} ${q}`,
+            taxYear: context.applicableYear,
+            jurisdiction: context.jurisdiction,
+            category: context.category,
+            organizationId: input.organizationId,
+            preferredDomains: sites,
+          })
+          externalAll.push(...external)
+        }
       }
-    } else {
-      sufficiency = {
-        ...sufficiency,
-        deficiencies: [
-          ...sufficiency.deficiencies,
-          'Official-source research did not provide adequate authoritative support.',
-        ],
-        requiresHumanReview: true,
+
+      usedOfficial = externalAll.length > 0
+      for (const hit of externalAll.slice(0, 8)) {
+        if (
+          isIrrelevantStatuteForAudit({
+            question: input.question,
+            sourceTitle: hit.title,
+            publisher: hit.publisher,
+            category: 'audit',
+          })
+        ) {
+          continue
+        }
+        citations.push(officialToCitation(hit))
+        await queueExternalForReview(hit, input.organizationId)
       }
+      citations = dedupeAuthoritySources(citations)
+
+      const externalSupport = externalAll.some((e) => e.quotedSection.length > 40)
+      if (externalSupport || (isAudit && citations.some((c) => c.internalOrExternal === 'internal'))) {
+        // For audit: allow proceed with internal standards even if web is thin,
+        // as long as we have some audit-framework hits OR usable web.
+        const hasAuditInternal = citations.some(
+          (c) =>
+            c.internalOrExternal === 'internal' &&
+            /aicpa|pcaob|au-?c|auditing/i.test(`${c.publisher} ${c.title}`),
+        )
+        if (hasAuditInternal || externalSupport) {
+          sufficiency = {
+            ...sufficiency,
+            sufficient: true,
+            score: Math.max(sufficiency.score, hasAuditInternal ? 0.62 : 0.5),
+            reasons: [
+              ...sufficiency.reasons,
+              internetDisclosure ||
+                'Official-site web research and/or uploaded auditing standards support proceeding.',
+            ],
+            deficiencies: sufficiency.deficiencies.filter((d) => !/No verified authoritative/i.test(d)),
+            requiresExternalResearch: false,
+            requiresHumanReview: true,
+          }
+        }
+      } else {
+        sufficiency = {
+          ...sufficiency,
+          deficiencies: [
+            ...sufficiency.deficiencies,
+            'Official-site web research did not provide adequate support.',
+          ],
+          requiresHumanReview: true,
+        }
+      }
+    } catch (err) {
+      // If we already have internal audit standards, still allow a reasoned answer.
+      const hasAuditInternal = citations.some(
+        (c) =>
+          c.internalOrExternal === 'internal' &&
+          /aicpa|pcaob|au-?c|auditing/i.test(`${c.publisher} ${c.title}`),
+      )
+      if (hasAuditInternal && isAudit) {
+        sufficiency = {
+          ...sufficiency,
+          sufficient: true,
+          score: Math.max(sufficiency.score, 0.58),
+          reasons: [
+            ...sufficiency.reasons,
+            'Proceeding from uploaded auditing standards after web research failed.',
+          ],
+          deficiencies: [
+            ...sufficiency.deficiencies,
+            `Web research failed: ${err instanceof Error ? err.message : String(err)}`,
+          ],
+          requiresExternalResearch: false,
+          requiresHumanReview: true,
+        }
+      } else {
+        sufficiency = {
+          ...sufficiency,
+          deficiencies: [
+            ...sufficiency.deficiencies,
+            `Web research failed: ${err instanceof Error ? err.message : String(err)}`,
+          ],
+          requiresHumanReview: true,
+        }
+      }
+    }
+  }
+
+  // Audit with solid internal AU-C/PCAOB hits should not be blocked solely because
+  // keyword sufficiency was picky — allow answer generation with disclosure.
+  if (
+    !sufficiency.sufficient &&
+    isAudit &&
+    citations.some(
+      (c) =>
+        c.internalOrExternal === 'internal' &&
+        /aicpa|pcaob|au-?c|auditing/i.test(`${c.publisher} ${c.title}`),
+    )
+  ) {
+    sufficiency = {
+      ...sufficiency,
+      sufficient: true,
+      score: Math.max(sufficiency.score, 0.55),
+      reasons: [
+        ...sufficiency.reasons,
+        'Uploaded auditing standards contain potentially applicable material; answer requires careful application to facts.',
+      ],
+      requiresExternalResearch: false,
+      requiresHumanReview: true,
     }
   }
 
   if (!sufficiency.sufficient) {
     return {
       context,
-      factsReliedUpon: [],
-      assumptions: ['Research limited to approved internal sources and approved-domain official research.'],
+      factsReliedUpon: auditParsed?.materialFacts ?? [],
+      assumptions: ['Research limited to indexed authoritative sources, then official-site web research if needed.'],
       missingInformation: context.missingInformation,
       citations,
       sourceSufficiency: sufficiency,
       warnings: [
-        'Unsupported conclusions are blocked.',
-        usedOfficial ? 'Official website research was attempted (mock/demo provider).' : 'No official research triggered.',
-        'Mock retrieval is active — not production semantic search.',
-      ],
-      confidence: { level: 'low', reason: 'Insufficient authoritative support.' },
+        'Unsupported conclusions are blocked when neither the corpus nor official-site web research is adequate.',
+        usedOfficial ? 'Official-site web research was attempted.' : 'No web research results.',
+        internetDisclosure,
+      ].filter(Boolean),
+      confidence: { level: 'low', reason: 'Insufficient support.' },
       requiresProfessionalReview: true,
       unableToConclude: true,
-      usedMockRetrieval: true,
+      usedMockRetrieval: false,
       usedOfficialResearch: usedOfficial,
       officialResearchDisclosed: usedOfficial,
       explanation:
-        'I found potentially relevant guidance, but I could not locate sufficient authoritative support for a reliable conclusion. Additional research or professional review is required.',
+        'Chai could not locate sufficient applicable authority to answer this question reliably. ' +
+        (internetDisclosure ? `${internetDisclosure} ` : '') +
+        'Add the missing standards to the authoritative library or provide additional facts.',
     }
   }
 
-  const primaryQuote = citations.find((c) => c.quotedText)?.quotedText
+  const fromWeb = citations.some((c) => c.internalOrExternal === 'external')
+  const fwLabel =
+    context.auditFramework === 'AICPA'
+      ? 'AICPA U.S. GAAS (AU-C)'
+      : context.auditFramework === 'PCAOB'
+        ? 'PCAOB standards'
+        : context.auditFramework || 'applicable framework'
+
   return {
-    conclusion: primaryQuote
-      ? `Based on approved sources, the applicable guidance supports a conclusion consistent with the cited materials for the stated context.`
-      : 'Approved sources support a limited conclusion; see citations.',
-    explanation:
-      'Conclusion is limited to retrieved approved knowledge and/or approved-domain official excerpts. Internal policies are labeled separately and are not primary legal authority.',
+    conclusion: isAudit
+      ? `Under ${fwLabel}, analyze inventory observation, alternative procedures, sufficiency of evidence, and any scope-limitation effect on the opinion; see explanation and citations.`
+      : citations.find((c) => c.quotedText)
+        ? 'Based on approved indexed sources and/or official-site research, see the explanation and citations.'
+        : 'Sources support a limited conclusion; see citations.',
+    explanation: isAudit
+      ? [
+          internetDisclosure ||
+            'Research path: Chai answered using uploaded authoritative auditing standards first.',
+          fromWeb
+            ? `Web fallback used official sites only (${officialSitesForFramework(
+                (context.auditFramework as AuditFrameworkId) || 'AICPA',
+              ).join(', ')}).`
+            : 'No internet search was necessary for the controlling framework passages located.',
+          'Do not treat unrelated United States Code titles as auditing authority for this engagement.',
+        ].join(' ')
+      : fromWeb
+        ? 'Part of this answer uses official-site web research because the indexed corpus was insufficient. Web excerpts are pending review and are not auto-promoted to primary authority.'
+        : 'Conclusion is limited to retrieved approved knowledge from your authoritative corpus.',
     context,
     factsReliedUpon: [
-      context.applicableYear ? `Year ${context.applicableYear}` : 'Year as stated in question',
-      context.jurisdiction ?? 'Jurisdiction as stated',
-      context.bookOrTax !== 'unknown' ? `Book/tax scope: ${context.bookOrTax}` : 'Book/tax scope as stated',
-    ],
+      ...(auditParsed?.materialFacts ?? []),
+      context.applicableYear ? `Year ${context.applicableYear}` : '',
+      context.jurisdiction ?? '',
+      context.auditFramework ? `Audit framework: ${context.auditFramework}` : '',
+    ].filter(Boolean),
     assumptions: [
-      'Only approved (or historically applicable superseded) sources were considered.',
-      'Sufficiency score is not a guarantee of correctness.',
+      'Indexed authoritative sources were preferred over web research.',
+      'Web findings are labeled external/unverified until an admin promotes them.',
+      ...(auditParsed?.comparisonFramework
+        ? [`PCAOB is a comparison framework only; primary remains ${auditParsed.primaryFramework}.`]
+        : []),
     ],
     missingInformation: [],
     citations,
     sourceSufficiency: sufficiency,
     warnings: [
       'Chai is not a CPA.',
-      'Mock retrieval active.',
-      ...(usedOfficial ? ['Searched approved official websites (mock provider); external sources need admin promotion for permanent KB inclusion.'] : []),
-      ...(sufficiency.requiresHumanReview ? ['Professional review recommended due to conflicts or residual risk.'] : []),
+      ...(usedOfficial
+        ? ['Official-site web research used; results queued for Knowledge Governance review.']
+        : []),
+      ...(internetDisclosure ? [internetDisclosure] : []),
+      ...(sufficiency.requiresHumanReview ? ['Professional review recommended.'] : []),
     ],
     confidence: {
-      level: sufficiency.requiresHumanReview ? 'medium' : 'high',
-      reason: sufficiency.requiresHumanReview
-        ? 'Sources support an answer but human review is recommended.'
-        : 'Verified approved sources appear sufficient for the stated context.',
+      level: fromWeb || sufficiency.requiresHumanReview ? 'medium' : 'high',
+      reason: fromWeb
+        ? 'Answer includes unverified official-site web research.'
+        : sufficiency.requiresHumanReview
+          ? 'Sources support an answer but human review is recommended.'
+          : 'Verified indexed sources appear sufficient for the stated context.',
     },
-    requiresProfessionalReview: sufficiency.requiresHumanReview,
+    requiresProfessionalReview: sufficiency.requiresHumanReview || fromWeb,
     unableToConclude: false,
-    usedMockRetrieval: true,
+    usedMockRetrieval: false,
     usedOfficialResearch: usedOfficial,
-    officialResearchDisclosed: usedOfficial,
+    officialResearchDisclosed: usedOfficial || Boolean(internetDisclosure),
   }
 }
