@@ -82,7 +82,7 @@ export function StructuredAnswerCard({
       )}
 
       {structured.missingFacts && structured.missingFacts.length > 0 && (
-        <section>
+        <section className="research-missing-section">
           <h3>Missing facts</h3>
           <ul>
             {structured.missingFacts.map((f) => (
@@ -94,9 +94,9 @@ export function StructuredAnswerCard({
 
       {structured.research && (
         <section className="sources-authority">
-          <h3>Sources and Authority</h3>
+          <h3 className="research-section-heading">Sources and Authority</h3>
           {structured.research.usedOfficialResearch && (
-            <p className="online-banner">
+            <p className="online-banner research-fallback-banner">
               Searched approved official websites — these results are not from your permanent knowledge base
               {structured.research.usedMockRetrieval ? ' (mock/demo provider)' : ''}.
             </p>
@@ -108,10 +108,13 @@ export function StructuredAnswerCard({
             </p>
           )}
           {structured.research.unableToConclude ? (
-            <p>
-              {structured.research.explanation ||
-                'I found potentially relevant guidance, but I could not locate sufficient authoritative support for a reliable conclusion. Additional research or professional review is required.'}
-            </p>
+            <div className="research-callout research-callout-error" role="alert">
+              <span className="research-callout-label">Insufficient authority</span>
+              <div className="research-callout-body">
+                {structured.research.explanation ||
+                  'I found potentially relevant guidance, but I could not locate sufficient authoritative support for a reliable conclusion. Additional research or professional review is required.'}
+              </div>
+            </div>
           ) : (
             <>
               {structured.research.conclusion && (
@@ -247,7 +250,7 @@ export function StructuredAnswerCard({
       ))}
 
       {structured.assumptions && structured.assumptions.length > 0 && (
-        <section>
+        <section className="research-missing-section">
           <h3>Assumptions</h3>
           <ul>
             {structured.assumptions.map((a) => (

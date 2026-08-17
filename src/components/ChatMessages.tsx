@@ -2,6 +2,8 @@ import { useEffect, useRef } from 'react'
 import type { Message, ResponseMode } from '../types'
 import { ChaiMark } from './ChaiMark'
 import { StructuredAnswerCard } from './StructuredAnswerCard'
+import { ResearchAnswerContent } from './ResearchAnswerContent'
+import { parseResearchAnswerSections } from '../research/researchColors.ts'
 
 interface ChatMessagesProps {
   messages: Message[]
@@ -51,8 +53,18 @@ export function ChatMessages({
                 )}
               </div>
               <div className="message-body">
-                {message.content || (isLastAssistant ? statusLine || '' : '…')}
-                {isLastAssistant && <span className="caret" aria-hidden />}
+                {message.role === 'assistant' &&
+                parseResearchAnswerSections(message.content || '') ? (
+                  <ResearchAnswerContent
+                    content={message.content || ''}
+                    unableToConclude={message.structured?.research?.unableToConclude}
+                  />
+                ) : (
+                  <>
+                    {message.content || (isLastAssistant ? statusLine || '' : '…')}
+                    {isLastAssistant && <span className="caret" aria-hidden />}
+                  </>
+                )}
               </div>
               {message.role === 'assistant' && message.structured && (
                 <StructuredAnswerCard

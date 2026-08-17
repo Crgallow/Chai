@@ -47,7 +47,7 @@ export function ResearchProcessPanel({ run }: ResearchProcessPanelProps) {
 
   return (
     <section className="research-process">
-      <h3>Accounting research process</h3>
+      <h3 className="research-section-heading">Accounting research process</h3>
       <p className="field-hint">
         Application-enforced workflow — public stage summaries only (not model chain-of-thought).
         {run.usedResponsesApi ? ' · Responses API' : ''}
