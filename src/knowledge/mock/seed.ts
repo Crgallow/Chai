@@ -1,5 +1,5 @@
 import type { KnowledgeSource } from '../schemas.ts'
-import { KG_FILES, saveChunks, saveSources, uid } from '../store/jsonStore.ts'
+import { KG_FILES, listSources, replaceChunksForSource, saveSources, uid } from '../store/jsonStore.ts'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -130,7 +130,10 @@ export async function seedDemoKnowledgeIfEmpty(force = false): Promise<Knowledge
     status: 'draft',
   })
 
-  const sources = [irs2025, irs2020, pcaob, policy, conflictA, unverified, restricted, failed]
+  const demoSources = [irs2025, irs2020, pcaob, policy, conflictA, unverified, restricted, failed]
+  const existing = await listSources().catch(() => [] as KnowledgeSource[])
+  const kept = existing.filter((s) => !s.id.startsWith('ks_demo_'))
+  const sources = [...kept, ...demoSources]
   await saveSources(sources)
 
   const texts: Record<string, string> = {
@@ -150,29 +153,35 @@ export async function seedDemoKnowledgeIfEmpty(force = false): Promise<Knowledge
     ks_demo_failed_index: '',
   }
 
-  const chunks = Object.entries(texts)
-    .filter(([, t]) => t)
-    .map(([sourceId, text]) => ({
-      id: uid('chunk'),
-      sourceId,
-      chunkIndex: 0,
-      text,
-      page: 1,
-      section: 'demo',
-      paragraph: 'p1',
-      headingHierarchy: ['Demo'],
-      applicableYear: sources.find((s) => s.id === sourceId)?.taxYear,
-      jurisdiction: sources.find((s) => s.id === sourceId)?.jurisdiction,
-      authorityLevel: sources.find((s) => s.id === sourceId)?.authorityLevel,
-      documentStatus: sources.find((s) => s.id === sourceId)?.status,
-      startOffset: 0,
-      endOffset: text.length,
-    }))
-
-  await saveChunks(chunks)
+  // Replace only demo chunks — never wipe uploaded authoritative chunk files.
+  for (const [sourceId, text] of Object.entries(texts)) {
+    if (!text) {
+      await replaceChunksForSource(sourceId, [])
+      continue
+    }
+    const meta = demoSources.find((s) => s.id === sourceId)
+    await replaceChunksForSource(sourceId, [
+      {
+        id: uid('chunk'),
+        sourceId,
+        chunkIndex: 0,
+        text,
+        page: 1,
+        section: 'demo',
+        paragraph: 'p1',
+        headingHierarchy: ['Demo'],
+        applicableYear: meta?.taxYear,
+        jurisdiction: meta?.jurisdiction,
+        authorityLevel: meta?.authorityLevel,
+        documentStatus: meta?.status,
+        startOffset: 0,
+        endOffset: text.length,
+      },
+    ])
+  }
 
   // write tiny demo files for preview
-  for (const s of sources) {
+  for (const s of demoSources) {
     if (!texts[s.id]) continue
     const name = `${s.id}__demo.txt`
     s.storagePath = name
@@ -180,8 +189,9 @@ export async function seedDemoKnowledgeIfEmpty(force = false): Promise<Knowledge
     s.mimeType = 'text/plain'
     await fs.writeFile(path.join(KG_FILES, name), texts[s.id], 'utf8')
   }
-  await saveSources(sources)
-  return sources
+  const finalSources = [...kept, ...demoSources]
+  await saveSources(finalSources)
+  return finalSources
 }
 
 export const MOCK_SCENARIO_NAMES = [

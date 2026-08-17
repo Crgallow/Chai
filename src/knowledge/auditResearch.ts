@@ -354,47 +354,371 @@ export function scoreAuditPassageRelevance(
   }
   if (meta?.auditFramework) score += 0.15
   if (/united states code|title \d+/.test(hay)) score -= 0.5
+  // Prefer the standard named in the query (e.g. AS 2510 over unrelated PCAOB AS).
+  const asWanted = query.match(/\bAS\s+(\d{3,4})\b/i)
+  if (asWanted) {
+    if (new RegExp(`\\bAS\\s*${asWanted[1]}\\b`, 'i').test(`${meta?.title ?? ''} ${hay}`)) score += 0.45
+    else if (/\bAS\s+\d{3,4}\b/i.test(meta?.title ?? '') && !new RegExp(`AS\\s*${asWanted[1]}`, 'i').test(meta?.title ?? '')) {
+      score -= 0.35
+    }
+  }
+  const aucWanted = query.match(/\bAU-C\s+(\d{3}[A-Z]?)\b/i)
+  if (aucWanted) {
+    if (new RegExp(`AU-C\\s*(?:Sec(?:tion)?\\.?:?\\s*)?${aucWanted[1]}\\b`, 'i').test(hay)) score += 0.35
+  }
   return Math.max(0, score)
 }
 
+/** Extract AU-C / PCAOB section labels from passage text (large PDFs often share one file title). */
+export function extractStandardSectionLabel(text: string, fallbackSection?: string): string | undefined {
+  const hay = text || ''
+  const auc =
+    hay.match(/\bAU-C\s*(?:Sec(?:tion)?\.?\s*)?(\d{3}[A-Z]?)\b/i) ||
+    hay.match(/\bSection\s+(\d{3}[A-Z]?)\b.*?(?:inventory|opinion|evidence|scope)/i)
+  if (auc) return `AU-C ${auc[1]}`
+  const as = hay.match(/\bAS\s+(\d{3,4})\b/i)
+  if (as) return `AS ${as[1]}`
+  const para = hay.match(/\.(0?\d{1,2})\s+[A-Z]/)
+  if (fallbackSection && /AU-C|AS\s+\d/i.test(fallbackSection)) return fallbackSection
+  if (para && fallbackSection) return `${fallbackSection} ¶.${para[1]}`
+  return fallbackSection || undefined
+}
+
+/** Material issue themes that must be covered by distinct passages when possible. */
+export const AUDIT_ISSUE_THEMES = [
+  {
+    id: 'inventory_observation',
+    label: 'inventory observation',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C 501 physical inventory counting attendance observation existence',
+    match: /physical\s+inventory|inventory\s+count(?:ing)?|attend(?:ance)?\s+at\s+physical|observe\s+the\s+performance\s+of\s+management/i,
+  },
+  {
+    id: 'alternative_date',
+    label: 'observation on an alternative date',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C 501 inventory count date financial statements rollforward changes recorded',
+    match: /count\s+date\s+and\s+the\s+date\s+of\s+the\s+financial\s+statements|between\s+the\s+count\s+date|inventory\s+counting\s+at\s+a\s+date\s+other|roll\s*-?\s*forward|roll\s*-?\s*back|subsequent\s+to\s+the\s+date/i,
+  },
+  {
+    id: 'alternative_procedures',
+    label: 'alternative audit procedures',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C 501 alternative procedures unable to attend physical inventory',
+    match: /alternative\s+procedures|unable\s+to\s+attend|did\s+not\s+attend|attendance\s+at\s+physical\s+inventory/i,
+  },
+  {
+    id: 'saae',
+    label: 'sufficient appropriate audit evidence',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C 500 sufficient appropriate audit evidence',
+    match: /sufficient\s+appropriate\s+audit\s+evidence|AU-C\s*(?:Section\s*)?500\b/i,
+  },
+  {
+    id: 'inability_evidence',
+    label: 'inability to obtain audit evidence',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C inability to obtain sufficient appropriate audit evidence modify opinion',
+    match: /unable\s+to\s+obtain\s+sufficient|inability\s+to\s+obtain|cannot\s+obtain\s+sufficient/i,
+  },
+  {
+    id: 'scope_limitation',
+    label: 'scope limitations',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C 705 scope limitation modify opinion auditor report',
+    match: /scope\s+limitation|modify\s+the\s+opinion|section\s+705/i,
+  },
+  {
+    id: 'qualified_opinion',
+    label: 'qualified opinions',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C 705 qualified opinion material not pervasive',
+    match: /qualified\s+opinion|except\s+for/i,
+  },
+  {
+    id: 'disclaimer',
+    label: 'disclaimers',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C 705 disclaimer of opinion material and pervasive',
+    match: /disclaimer\s+of\s+opinion/i,
+  },
+  {
+    id: 'materiality_pervasiveness',
+    label: 'materiality and pervasiveness',
+    framework: 'AICPA' as AuditFrameworkId,
+    query: 'AU-C 705 material pervasive effects financial statements',
+    match: /pervasive|material\s+but\s+not\s+pervasive|effects?\s+on\s+the\s+financial\s+statements/i,
+  },
+  {
+    id: 'pcaob_inventory',
+    label: 'PCAOB inventory observation',
+    framework: 'PCAOB' as AuditFrameworkId,
+    query: 'PCAOB AS 2510 auditing inventories observation physical',
+    match: /AS\s*2510|auditing\s+inventories/i,
+  },
+  {
+    id: 'pcaob_opinion',
+    label: 'PCAOB scope limitation / opinion',
+    framework: 'PCAOB' as AuditFrameworkId,
+    query: 'PCAOB AS 3105 departures unqualified opinion qualified disclaimer',
+    match: /AS\s*3105|departures?\s+from\s+unqualified/i,
+  },
+] as const
+
+export type AuditIssueThemeId = (typeof AUDIT_ISSUE_THEMES)[number]['id']
+
+export function themesForParsedQuestion(parsed: ParsedAuditQuestion) {
+  const needsPcaob = Boolean(parsed.comparisonFramework === 'PCAOB' || parsed.primaryFramework === 'PCAOB')
+  return AUDIT_ISSUE_THEMES.filter((t) => {
+    if (t.framework === 'PCAOB') return needsPcaob
+    return parsed.primaryFramework === 'AICPA' || !parsed.primaryFramework
+  })
+}
+
+export function buildIssueTargetedQueries(parsed: ParsedAuditQuestion): {
+  id: string
+  label: string
+  framework: AuditFrameworkId
+  query: string
+}[] {
+  return themesForParsedQuestion(parsed).map((t) => ({
+    id: t.id,
+    label: t.label,
+    framework: t.framework,
+    query: t.query,
+  }))
+}
+
+export interface AuthorityUsageSummary {
+  documentsUsed: number
+  sectionsUsed: number
+  passagesUsed: number
+  frameworks: string[]
+  documentTitles: string[]
+  sectionLabels: string[]
+  issuesSupportedInternally: string[]
+  issuesNeedingInternet: string[]
+  websitesSearched: string[]
+}
+
+export function summarizeAuthorityUsage(input: {
+  citations: {
+    publisher: string
+    title: string
+    section?: string
+    paragraph?: string
+    page?: number
+    quotedText?: string
+    sourceId?: string
+    internalOrExternal?: 'internal' | 'external'
+    sourceUrl?: string
+  }[]
+  issueCoverage: { id: string; label: string; supported: boolean; origin: 'internal' | 'internet' | 'none' }[]
+  websitesSearched?: string[]
+}): AuthorityUsageSummary {
+  const docs = new Set<string>()
+  const sections = new Set<string>()
+  for (const c of input.citations) {
+    docs.add(`${c.publisher}|${c.title}`.toLowerCase())
+    const label =
+      extractStandardSectionLabel(c.quotedText || '', c.section) ||
+      c.section ||
+      (c.paragraph ? `¶${c.paragraph}` : undefined) ||
+      (c.page != null ? `p.${c.page}` : undefined)
+    if (label) sections.add(label)
+  }
+  return {
+    documentsUsed: docs.size,
+    sectionsUsed: sections.size,
+    passagesUsed: input.citations.length,
+    frameworks: [
+      ...new Set(
+        input.citations.flatMap((c) => {
+          const t = `${c.title} ${c.quotedText || ''} ${c.section || ''}`
+          const out: string[] = []
+          if (/AU-C|AICPA|GAAS/i.test(t)) out.push('AICPA U.S. GAAS (AU-C)')
+          if (/PCAOB|\bAS\s+\d{3,4}\b/i.test(t)) out.push('PCAOB')
+          return out
+        }),
+      ),
+    ],
+    documentTitles: [...new Set(input.citations.map((c) => c.title))],
+    sectionLabels: [...sections],
+    issuesSupportedInternally: input.issueCoverage
+      .filter((i) => i.origin === 'internal')
+      .map((i) => i.label),
+    issuesNeedingInternet: input.issueCoverage
+      .filter((i) => i.origin === 'internet' || i.origin === 'none')
+      .map((i) => i.label),
+    websitesSearched: input.websitesSearched ?? [],
+  }
+}
+
+export function evaluateIssueCoverage(input: {
+  parsed: ParsedAuditQuestion
+  passages: { text: string; internal: boolean; title?: string; publisher?: string }[]
+}): {
+  id: string
+  label: string
+  supported: boolean
+  origin: 'internal' | 'internet' | 'none'
+  matchedPassageIndex?: number
+}[] {
+  const themes = themesForParsedQuestion(input.parsed)
+  return themes.map((theme) => {
+    const internalIdx = input.passages.findIndex(
+      (p) => p.internal && theme.match.test(`${p.title || ''} ${p.text}`),
+    )
+    if (internalIdx >= 0) {
+      return {
+        id: theme.id,
+        label: theme.label,
+        supported: true,
+        origin: 'internal' as const,
+        matchedPassageIndex: internalIdx,
+      }
+    }
+    const webIdx = input.passages.findIndex(
+      (p) => !p.internal && theme.match.test(`${p.title || ''} ${p.text}`),
+    )
+    if (webIdx >= 0) {
+      return {
+        id: theme.id,
+        label: theme.label,
+        supported: true,
+        origin: 'internet' as const,
+        matchedPassageIndex: webIdx,
+      }
+    }
+    return { id: theme.id, label: theme.label, supported: false, origin: 'none' as const }
+  })
+}
+
+/**
+ * Deduplicate authorities without collapsing multiple sections/paragraphs from one document.
+ * Prefer internal copy when an internet duplicate of the same section exists.
+ */
 export function dedupeAuthoritySources<
   T extends {
     publisher: string
     title: string
     section?: string
+    paragraph?: string
+    page?: number
+    quotedText?: string
     sourceUrl?: string
     sourceId?: string
+    internalOrExternal?: 'internal' | 'external'
   },
 >(items: T[]): T[] {
   const seen = new Set<string>()
   const out: T[] = []
-  for (const item of items) {
+  // Prefer internal first so internet verification copies lose to uploaded text.
+  const ordered = [...items].sort((a, b) => {
+    const ai = a.internalOrExternal === 'internal' ? 0 : 1
+    const bi = b.internalOrExternal === 'internal' ? 0 : 1
+    return ai - bi
+  })
+  for (const item of ordered) {
+    const sectionLabel =
+      extractStandardSectionLabel(item.quotedText || '', item.section) || item.section || ''
+    const excerptKey = (item.quotedText || '').slice(0, 120).toLowerCase().replace(/\s+/g, ' ')
     const key = [
       item.publisher.toLowerCase().trim(),
       item.title.toLowerCase().replace(/\s+/g, ' ').trim(),
-      (item.section || '').toLowerCase().trim(),
-      (item.sourceId || '').replace(/^ks_repo_/, ''),
+      sectionLabel.toLowerCase().trim(),
+      (item.paragraph || '').toLowerCase(),
+      item.page != null ? `p${item.page}` : '',
+      excerptKey,
     ].join('|')
     if (seen.has(key)) continue
-    // Also collapse internal/external same title
-    const soft = `${item.publisher}|${item.title}`.toLowerCase()
-    if ([...seen].some((k) => k.startsWith(soft))) continue
+    // Collapse only true duplicates (same section + near-identical excerpt), not whole documents.
+    const softSection = `${item.publisher}|${item.title}|${sectionLabel}`.toLowerCase()
+    if (
+      sectionLabel &&
+      [...seen].some((k) => k.startsWith(softSection) && k.includes(excerptKey.slice(0, 60)))
+    ) {
+      continue
+    }
     seen.add(key)
     out.push(item)
   }
   return out
 }
 
+export function formatAuthorityUsageBlock(usage: AuthorityUsageSummary): string {
+  return [
+    `Documents used: ${usage.documentsUsed}`,
+    `Authoritative sections used: ${usage.sectionsUsed}`,
+    `Supporting passages used: ${usage.passagesUsed}`,
+  ].join('\n')
+}
+
+export function buildResearchPathDisclosure(input: {
+  usedInternet: boolean
+  primaryFramework?: AuditFrameworkId
+  comparisonFramework?: AuditFrameworkId
+  unresolvedIssues: string[]
+  internetOrgs: string[]
+  internalHadPrimary: boolean
+  internalHadComparison: boolean
+}): string {
+  if (!input.usedInternet) {
+    return 'Research path: Chai answered using uploaded authoritative auditing standards only. No internet search was necessary.'
+  }
+  const parts: string[] = [
+    'Research path: Chai searched the uploaded auditing standards first.',
+  ]
+  if (input.internalHadPrimary && input.comparisonFramework === 'PCAOB' && !input.internalHadComparison) {
+    parts.push(
+      'The internal document contained the applicable AICPA guidance but did not contain the requested PCAOB standards, so Chai searched the official PCAOB website for the comparison.',
+    )
+  } else if (input.unresolvedIssues.length) {
+    parts.push(
+      `Because the internal library did not fully resolve ${input.unresolvedIssues.join('; ')}, Chai then searched ${
+        input.internetOrgs.join(', ') || 'official AICPA/PCAOB sources'
+      }.`,
+    )
+  } else {
+    parts.push(
+      `Chai then searched ${input.internetOrgs.join(', ') || 'official sources'} to verify or complete coverage.`,
+    )
+  }
+  return parts.join(' ')
+}
+
 export function buildInventoryGaasAnswerSkeleton(input: {
   parsed: ParsedAuditQuestion
-  primaryPassages: { publisher: string; title: string; exactPassage?: string; section?: string }[]
-  comparisonPassages: { publisher: string; title: string; exactPassage?: string; section?: string }[]
+  primaryPassages: {
+    publisher: string
+    title: string
+    exactPassage?: string
+    section?: string
+    paragraph?: string
+    page?: number
+  }[]
+  comparisonPassages: {
+    publisher: string
+    title: string
+    exactPassage?: string
+    section?: string
+  }[]
   usedInternet: boolean
   unresolvedIssues: string[]
   internetOrgs: string[]
+  usage?: AuthorityUsageSummary
+  internalHadPrimary?: boolean
+  internalHadComparison?: boolean
 }): string {
-  const { parsed, primaryPassages, usedInternet, unresolvedIssues, internetOrgs } = input
-  const cite = (i: number) => (primaryPassages[i] ? ` [${primaryPassages[i].publisher}: ${primaryPassages[i].title}${primaryPassages[i].section ? `, ${primaryPassages[i].section}` : ''}]` : '')
+  const { parsed, primaryPassages, comparisonPassages, usedInternet, unresolvedIssues, internetOrgs } =
+    input
+  const cite = (i: number) => {
+    const p = primaryPassages[i]
+    if (!p) return ''
+    const sec =
+      extractStandardSectionLabel(p.exactPassage || '', p.section) || p.section || undefined
+    return ` [${p.publisher}: ${p.title}${sec ? `, ${sec}` : ''}]`
+  }
 
   const fwLabel =
     parsed.primaryFramework === 'AICPA'
@@ -404,17 +728,42 @@ export function buildInventoryGaasAnswerSkeleton(input: {
         : 'the stated auditing framework'
 
   const passagesBlurb = [...new Map(
-    primaryPassages.map((p) => [`${p.publisher}|${p.title}|${p.section || ''}`, p]),
+    [...primaryPassages, ...comparisonPassages].map((p) => {
+      const sec = extractStandardSectionLabel(p.exactPassage || '', p.section) || p.section || ''
+      return [`${p.publisher}|${p.title}|${sec}|${(p.exactPassage || '').slice(0, 80)}`, { ...p, sec }]
+    }),
   ).values()]
-    .slice(0, 4)
-    .map((p, i) => `(${i + 1}) ${p.publisher} — ${p.title}${p.section ? ` (${p.section})` : ''}`)
+    .slice(0, 10)
+    .map((p, i) => `(${i + 1}) ${p.publisher} — ${p.title}${p.sec ? ` (${p.sec})` : ''}`)
     .join('\n')
 
-  const researchPath = usedInternet
-    ? `Research path: Chai searched the uploaded authoritative auditing standards first. Because the internal library did not fully resolve ${
-        unresolvedIssues.join('; ') || 'one or more material issues'
-      }, Chai then searched ${internetOrgs.join(', ') || 'official AICPA/PCAOB sources'}.`
-    : 'Research path: Chai answered using uploaded authoritative auditing standards only. No internet search was necessary.'
+  const usage = input.usage
+  const usageBlock = usage
+    ? formatAuthorityUsageBlock(usage)
+    : formatAuthorityUsageBlock(
+        summarizeAuthorityUsage({
+          citations: primaryPassages.map((p) => ({
+            publisher: p.publisher,
+            title: p.title,
+            section: p.section,
+            paragraph: p.paragraph,
+            page: p.page,
+            quotedText: p.exactPassage,
+            internalOrExternal: 'internal',
+          })),
+          issueCoverage: [],
+        }),
+      )
+
+  const researchPath = buildResearchPathDisclosure({
+    usedInternet,
+    primaryFramework: parsed.primaryFramework,
+    comparisonFramework: parsed.comparisonFramework,
+    unresolvedIssues,
+    internetOrgs,
+    internalHadPrimary: input.internalHadPrimary ?? primaryPassages.length > 0,
+    internalHadComparison: input.internalHadComparison ?? comparisonPassages.length > 0,
+  })
 
   return [
     '## Direct conclusion',
@@ -428,6 +777,13 @@ export function buildInventoryGaasAnswerSkeleton(input: {
     '',
     '## Issues identified',
     ...parsed.issues.map((i) => `- ${i}`),
+    '',
+    '## Authority usage',
+    usageBlock,
+    usage?.frameworks?.length ? `Standards/frameworks used: ${usage.frameworks.join('; ')}` : '',
+    usage?.sectionLabels?.length
+      ? `Sections/paragraphs referenced: ${usage.sectionLabels.slice(0, 12).join('; ')}`
+      : '',
     '',
     '## Relevant standards (from research)',
     passagesBlurb || '- Controlling AU-C / PCAOB passages must be verified; see Sources.',
@@ -452,16 +808,22 @@ export function buildInventoryGaasAnswerSkeleton(input: {
     '',
     '## Separate PCAOB comparison',
     parsed.comparisonFramework === 'PCAOB'
-      ? 'If the same entity were a public company audited under PCAOB standards, inventory observation / audit evidence and reporting consequences are addressed under PCAOB AS (e.g., inventories and opinion departures). The core problem—missed observation, alternative procedures, and possible scope limitation—remains, but the controlling standards and report wording follow PCAOB rather than AU-C. Do not substitute PCAOB as the primary framework for the private-company facts.'
+      ? comparisonPassages.length
+        ? `If the same entity were a public company audited under PCAOB standards, inventory observation and reporting consequences are addressed under PCAOB AS (retrieved internally). The core problem—missed observation, alternative procedures, and possible scope limitation—remains, but the controlling standards and report wording follow PCAOB rather than AU-C. Do not substitute PCAOB as the primary framework for the private-company facts. [${comparisonPassages[0].publisher}: ${comparisonPassages[0].title}]`
+        : 'If the same entity were a public company audited under PCAOB standards, inventory observation / audit evidence and reporting consequences are addressed under PCAOB AS (e.g., inventories and opinion departures). The core problem—missed observation, alternative procedures, and possible scope limitation—remains, but the controlling standards and report wording follow PCAOB rather than AU-C. Do not substitute PCAOB as the primary framework for the private-company facts.'
       : 'No PCAOB comparison was requested.',
     '',
     '## Missing facts / assumptions',
-    '- Exact AU-C section/paragraph cites should be verified against the official text when excerpts are incomplete.',
     '- Final opinion type depends on whether alternative procedures actually produce sufficient appropriate evidence and on pervasiveness judgment.',
+    usage?.issuesNeedingInternet?.length
+      ? `- Issues still thin after retrieval: ${usage.issuesNeedingInternet.join('; ')}`
+      : '- Exact paragraph cites should be verified against the official text when excerpts are incomplete.',
     '',
     '## Research-path disclosure',
     researchPath,
-  ].join('\n')
+  ]
+    .filter((line) => line !== '')
+    .join('\n')
 }
 
 export function computeAuditAnswerConfidence(input: {
@@ -476,6 +838,12 @@ export function computeAuditAnswerConfidence(input: {
   unansweredMaterialIssues: number
   usedOnlySecondary: boolean
   materialMissingFacts: number
+  /** Distinct issue themes supported by retrieved passages (not document file count). */
+  issueThemesSupported?: number
+  issueThemesTotal?: number
+  /** True when coverage is only one narrow theme (e.g. opinions only). */
+  singleThemeOnly?: boolean
+  documentsUsed?: number
 }): { score: number; explanationLines: string[] } {
   let score = 0
   const lines: string[] = []
@@ -493,27 +861,43 @@ export function computeAuditAnswerConfidence(input: {
 
   if (input.controllingAuthorityFound) {
     score += 25
-    lines.push('Controlling-authority coverage: +25.')
+    lines.push(
+      `Controlling-authority coverage: +25${
+        input.documentsUsed != null
+          ? ` (${input.documentsUsed} uploaded auditing-standards document(s) used — document count does not reduce score).`
+          : '.'
+      }`,
+    )
   } else {
     score -= 25
     lines.push('Missing controlling authority: −25.')
   }
 
-  const coverRatio = input.checklistTotal
-    ? input.checklistSupported / input.checklistTotal
-    : 0
+  const themeTotal = input.issueThemesTotal ?? input.checklistTotal
+  const themeSupported = input.issueThemesSupported ?? input.checklistSupported
+  const coverRatio = themeTotal ? themeSupported / themeTotal : 0
   const coverPts = Math.round(20 * coverRatio)
   score += coverPts
   lines.push(
-    `Issue-checklist coverage: +${coverPts} (${input.checklistSupported}/${input.checklistTotal} supported).`,
+    `Issue-theme passage coverage: +${coverPts} (${themeSupported}/${themeTotal} material themes supported by retrieved sections/passages).`,
   )
 
-  const citePts = Math.min(15, input.verifiedCitations * 5)
-  score += citePts
-  lines.push(`Citation verification: +${citePts}.`)
-  score -= input.unverifiedCitations * 10
-  if (input.unverifiedCitations) lines.push(`Unverified citations: −${input.unverifiedCitations * 10}.`)
+  if (input.singleThemeOnly) {
+    score -= 20
+    lines.push(
+      'Single-theme penalty: −20 (one paragraph/theme such as modified opinions alone cannot support the full inventory answer).',
+    )
+  }
 
+  const citePts = Math.min(15, Math.max(0, themeSupported) * 3)
+  score += citePts
+  lines.push(`Citation support for covered themes: +${citePts}.`)
+  score -= Math.min(20, input.unverifiedCitations * 5)
+  if (input.unverifiedCitations) {
+    lines.push(
+      `Unverified citations: −${Math.min(20, input.unverifiedCitations * 5)} (capped; internet verification copies preferred not to inflate).`,
+    )
+  }
   score += 8
   lines.push('Effective-date / engagement timing: +8 (period identified from question).')
 
@@ -527,9 +911,12 @@ export function computeAuditAnswerConfidence(input: {
   score += 5
   lines.push('Cross-check completion: +5 (framework vs comparison separated).')
 
-  score -= input.unansweredMaterialIssues * 15
+  const unansweredPenalty = Math.min(45, input.unansweredMaterialIssues * 10)
+  score -= unansweredPenalty
   if (input.unansweredMaterialIssues) {
-    lines.push(`Unanswered material issues: −${input.unansweredMaterialIssues * 15}.`)
+    lines.push(
+      `Unanswered material issues: −${unansweredPenalty} (${input.unansweredMaterialIssues} theme(s); capped).`,
+    )
   }
   score -= input.irrelevantSources * 10
   if (input.irrelevantSources) {
@@ -538,6 +925,13 @@ export function computeAuditAnswerConfidence(input: {
   if (input.usedOnlySecondary) {
     score -= 15
     lines.push('Reliance only on secondary authority: −15.')
+  }
+
+  // Uploaded auditing-standards document count is not a penalty when sections cover the issues.
+  if ((input.documentsUsed ?? 0) >= 1 && (input.issueThemesSupported ?? 0) >= 4) {
+    lines.push(
+      'Note: one or few uploaded auditing-standards documents can support a high score when multiple required sections/passages were retrieved.',
+    )
   }
 
   score = Math.max(0, Math.min(100, score))

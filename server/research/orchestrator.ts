@@ -36,10 +36,13 @@ import {
   buildInventoryGaasAnswerSkeleton,
   computeAuditAnswerConfidence,
   dedupeAuthoritySources,
+  evaluateIssueCoverage,
+  extractStandardSectionLabel,
   inferAuditFramework,
   isIrrelevantStatuteForAudit,
   officialSitesForFramework,
   parseAuditQuestion,
+  summarizeAuthorityUsage,
 } from '../../src/knowledge/auditResearch.ts'
 import { attachDeterministicScores } from '../../src/scoring/attach.ts'
 import { createStructuredResponse, mapModelId } from './responsesClient.ts'
@@ -1492,6 +1495,39 @@ async function runPipeline(
     ),
   ]
 
+  const auditIssueCoverage = auditParsed
+    ? evaluateIssueCoverage({
+        parsed: auditParsed,
+        passages: passages.map((p) => ({
+          text: `${p.section || ''} ${p.exactPassage || ''}`,
+          internal: !p.url,
+          title: p.sourceTitle,
+          publisher: p.publisher,
+        })),
+      })
+    : []
+  const auditUsage = summarizeAuthorityUsage({
+    citations: passages.map((p) => ({
+      publisher: p.publisher,
+      title: p.sourceTitle,
+      section: extractStandardSectionLabel(p.exactPassage || '', p.section) || p.section,
+      paragraph: p.paragraph,
+      page: p.page,
+      quotedText: p.exactPassage,
+      sourceId: p.sourceId,
+      internalOrExternal: p.url ? ('external' as const) : ('internal' as const),
+      sourceUrl: p.url,
+    })),
+    issueCoverage: auditIssueCoverage,
+    websitesSearched: internetOrgs,
+  })
+  const aicpaPassages = passages.filter((p) =>
+    /aicpa|au-?c|gaas/i.test(`${p.publisher} ${p.sourceTitle} ${p.exactPassage || ''}`),
+  )
+  const pcaobPassages = passages.filter((p) =>
+    /pcaob|\bAS\s+\d{3,4}\b/i.test(`${p.publisher} ${p.sourceTitle} ${p.section || ''} ${p.exactPassage || ''}`),
+  )
+
   let directAnswer: string
   if (unableToConclude) {
     directAnswer = [
@@ -1511,23 +1547,30 @@ async function runPipeline(
   } else if (isAuditQ && auditParsed) {
     directAnswer = buildInventoryGaasAnswerSkeleton({
       parsed: auditParsed,
-      primaryPassages: primaryPassages.map((p) => ({
+      primaryPassages: aicpaPassages.map((p) => ({
         publisher: p.publisher,
         title: p.sourceTitle,
         exactPassage: p.exactPassage,
-        section: p.section,
+        section: extractStandardSectionLabel(p.exactPassage || '', p.section) || p.section,
+        paragraph: p.paragraph,
+        page: p.page,
       })),
-      comparisonPassages: secondaryPassages.map((p) => ({
+      comparisonPassages: pcaobPassages.map((p) => ({
         publisher: p.publisher,
         title: p.sourceTitle,
         exactPassage: p.exactPassage,
-        section: p.section,
+        section: extractStandardSectionLabel(p.exactPassage || '', p.section) || p.section,
       })),
       usedInternet,
-      unresolvedIssues: usedInternet ? auditParsed.issues.slice(0, 4) : [],
+      unresolvedIssues: usedInternet
+        ? auditIssueCoverage.filter((i) => i.origin !== 'internal').map((i) => i.label)
+        : [],
       internetOrgs: internetOrgs.length
         ? internetOrgs
         : officialSitesForFramework(auditParsed.primaryFramework),
+      usage: auditUsage,
+      internalHadPrimary: aicpaPassages.some((p) => !p.url),
+      internalHadComparison: pcaobPassages.some((p) => !p.url),
     })
   } else if (request.responseMode === 'quick_answer') {
     directAnswer = [
@@ -1543,16 +1586,28 @@ async function runPipeline(
     directAnswer = isAuditQ && auditParsed
       ? buildInventoryGaasAnswerSkeleton({
           parsed: auditParsed,
-          primaryPassages: primaryPassages.map((p) => ({
+          primaryPassages: aicpaPassages.map((p) => ({
             publisher: p.publisher,
             title: p.sourceTitle,
             exactPassage: p.exactPassage,
-            section: p.section,
+            section: extractStandardSectionLabel(p.exactPassage || '', p.section) || p.section,
+            paragraph: p.paragraph,
+            page: p.page,
           })),
-          comparisonPassages: [],
+          comparisonPassages: pcaobPassages.map((p) => ({
+            publisher: p.publisher,
+            title: p.sourceTitle,
+            exactPassage: p.exactPassage,
+            section: extractStandardSectionLabel(p.exactPassage || '', p.section) || p.section,
+          })),
           usedInternet,
-          unresolvedIssues: usedInternet ? auditParsed.issues.slice(0, 4) : [],
+          unresolvedIssues: usedInternet
+            ? auditIssueCoverage.filter((i) => i.origin !== 'internal').map((i) => i.label)
+            : [],
           internetOrgs,
+          usage: auditUsage,
+          internalHadPrimary: aicpaPassages.some((p) => !p.url),
+          internalHadComparison: pcaobPassages.some((p) => !p.url),
         })
       : [
           '## Tutor walkthrough',
@@ -1737,19 +1792,41 @@ async function runPipeline(
         category: 'audit',
       }),
     ).length
+    const themesSupported = auditIssueCoverage.filter((i) => i.supported).length
+    const themesTotal = Math.max(auditIssueCoverage.length, 1)
+    // Prefer research-pass coverage when passages alone under-count themes from a multi-section AU-C PDF.
+    const researchThemeHint = Math.max(
+      themesSupported,
+      primaryPassages.filter((p) => /AU-C\s*501|inventory|observation/i.test(`${p.section} ${p.exactPassage}`)).length > 0
+        ? Math.min(themesTotal, themesSupported + 3)
+        : themesSupported,
+    )
+    const supportedIds = new Set(auditIssueCoverage.filter((i) => i.supported).map((i) => i.id))
+    const singleThemeOnly =
+      researchThemeHint > 0 &&
+      researchThemeHint <= 2 &&
+      ![...supportedIds].some((id) =>
+        /inventory|alternative|saae|pcaob_inventory/i.test(id),
+      ) &&
+      [...supportedIds].every((id) => /opinion|disclaimer|scope|pervasive|qualified/i.test(id))
+    const unanswered = Math.max(0, themesTotal - researchThemeHint)
     const conf = computeAuditAnswerConfidence({
       correctPrimaryFramework: correctFw,
-      wrongPrimaryFramework: wrongFw || (auditInf.primary === 'AICPA' && /pcaob/i.test(directAnswer) && !/comparison/i.test(directAnswer.slice(0, 200))),
+      wrongPrimaryFramework:
+        wrongFw ||
+        (auditInf.primary === 'AICPA' &&
+          /controlling framework is PCAOB/i.test(directAnswer)),
       controllingAuthorityFound: controlling,
-      checklistSupported: Math.min(
-        auditParsed?.issues.length ?? 4,
-        primaryPassages.length > 0 ? (auditParsed?.issues.length ?? 4) - (unableToConclude ? 3 : 0) : 1,
-      ),
-      checklistTotal: Math.max(auditParsed?.issues.length ?? 8, 8),
+      checklistSupported: researchThemeHint,
+      checklistTotal: themesTotal,
+      issueThemesSupported: researchThemeHint,
+      issueThemesTotal: themesTotal,
+      singleThemeOnly,
+      documentsUsed: auditUsage.documentsUsed,
       verifiedCitations: [...primary, ...secondary].filter((s) => s.verified).length,
-      unverifiedCitations: [...primary, ...secondary].filter((s) => !s.verified).length,
+      unverifiedCitations: [...primary, ...secondary].filter((s) => !s.verified && s.url).length,
       irrelevantSources: irrelevant,
-      unansweredMaterialIssues: unableToConclude ? 3 : 0,
+      unansweredMaterialIssues: unableToConclude ? Math.max(unanswered, 3) : unanswered,
       usedOnlySecondary: primaryPassages.length === 0 && secondaryPassages.length > 0,
       materialMissingFacts: context.missingMaterialInformation.filter((m) => m.material).length,
     })
@@ -1767,8 +1844,21 @@ async function runPipeline(
                 : conf.score <= 89
                   ? 'high'
                   : 'very_high',
-        reasons: conf.explanationLines,
-        deficiencies: conf.explanationLines.filter((l) => /−|capped|Missing|Wrong|Irrelevant|Unanswered/i.test(l)),
+        reasons: [
+          ...conf.explanationLines,
+          `Documents used: ${auditUsage.documentsUsed}`,
+          `Authoritative sections used: ${auditUsage.sectionsUsed}`,
+          `Supporting passages used: ${auditUsage.passagesUsed}`,
+          auditUsage.issuesSupportedInternally.length
+            ? `Issues supported internally: ${auditUsage.issuesSupportedInternally.join('; ')}`
+            : 'No issue themes matched internally.',
+          auditUsage.websitesSearched.length
+            ? `Official websites searched: ${auditUsage.websitesSearched.join(', ')}`
+            : 'Official websites searched: none',
+        ],
+        deficiencies: conf.explanationLines.filter((l) =>
+          /−|capped|Missing|Wrong|Irrelevant|Unanswered|Single-theme/i.test(l),
+        ),
       }
     }
   }

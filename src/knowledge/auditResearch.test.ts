@@ -5,6 +5,8 @@ import {
   parseAuditQuestion,
   buildAuditSearchQueries,
   computeAuditAnswerConfidence,
+  dedupeAuthoritySources,
+  summarizeAuthorityUsage,
 } from './auditResearch.ts'
 import { classifyResearchContext } from './sufficiency/engine.ts'
 
@@ -37,6 +39,63 @@ describe('audit research framework inference', () => {
     const qs = buildAuditSearchQueries(parsed, 'primary')
     expect(qs.some((q) => /AU-C/i.test(q))).toBe(true)
     expect(qs.every((q) => !/united states code/i.test(q))).toBe(true)
+  })
+
+  it('keeps multiple sections from one document when deduping', () => {
+    const out = dedupeAuthoritySources([
+      {
+        publisher: 'AICPA',
+        title: 'AU-C Sections',
+        section: 'AU-C 501',
+        quotedText: 'observe the performance of management physical inventory counting',
+        internalOrExternal: 'internal' as const,
+      },
+      {
+        publisher: 'AICPA',
+        title: 'AU-C Sections',
+        section: 'AU-C 705',
+        quotedText: 'disclaimer of opinion when effects are pervasive',
+        internalOrExternal: 'internal' as const,
+      },
+      {
+        publisher: 'AICPA',
+        title: 'AU-C Sections',
+        section: 'AU-C 501',
+        quotedText: 'observe the performance of management physical inventory counting',
+        internalOrExternal: 'external' as const,
+        sourceUrl: 'https://example.com',
+      },
+    ])
+    expect(out.length).toBe(2)
+    expect(out.every((c) => c.internalOrExternal === 'internal')).toBe(true)
+  })
+
+  it('summarizes documents vs sections vs passages', () => {
+    const usage = summarizeAuthorityUsage({
+      citations: [
+        {
+          publisher: 'AICPA',
+          title: 'AU-C Sections',
+          section: 'AU-C 501',
+          quotedText: 'AU-C Section 501 inventory observation',
+          internalOrExternal: 'internal',
+        },
+        {
+          publisher: 'AICPA',
+          title: 'AU-C Sections',
+          section: 'AU-C 705',
+          quotedText: 'AU-C Section 705 qualified opinion',
+          internalOrExternal: 'internal',
+        },
+      ],
+      issueCoverage: [
+        { id: 'a', label: 'inventory observation', supported: true, origin: 'internal' },
+        { id: 'b', label: 'PCAOB comparison', supported: false, origin: 'none' },
+      ],
+    })
+    expect(usage.documentsUsed).toBe(1)
+    expect(usage.sectionsUsed).toBeGreaterThanOrEqual(2)
+    expect(usage.passagesUsed).toBe(2)
   })
 
   it('blocks unrelated USC titles for audit procedure questions', () => {

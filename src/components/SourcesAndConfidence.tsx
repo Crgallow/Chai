@@ -138,15 +138,44 @@ export function SourcesAndConfidence({ structured }: SourcesAndConfidenceProps) 
       )}
       {!isStudy && (
         <ul className="validation-list score-meta">
-          <li>
-            Sources used: {sourceQuality?.sourcesEvaluated ?? citations.length}
-            {sourceQuality != null && (
-              <>
-                {' '}
-                · Primary {sourceQuality.primarySources} · Secondary {sourceQuality.secondarySources}
-              </>
-            )}
-          </li>
+          {(() => {
+            const titles = new Set(citations.map((c) => `${c.publisher}|${c.title}`.toLowerCase()))
+            const sections = new Set(
+              citations
+                .map((c) => c.section)
+                .filter((s): s is string => Boolean(s && String(s).trim())),
+            )
+            const isAuditCitations = citations.some((c) =>
+              /aicpa|pcaob|au-?c|auditing/i.test(`${c.publisher} ${c.title} ${c.section || ''}`),
+            )
+            if (isAuditCitations && citations.length) {
+              return (
+                <>
+                  <li>Documents used: {titles.size}</li>
+                  <li>Authoritative sections used: {sections.size || '—'}</li>
+                  <li>Supporting passages used: {citations.length}</li>
+                  {sourceQuality != null && (
+                    <li>
+                      Primary {sourceQuality.primarySources} · Secondary{' '}
+                      {sourceQuality.secondarySources}
+                    </li>
+                  )}
+                </>
+              )
+            }
+            return (
+              <li>
+                Sources used: {sourceQuality?.sourcesEvaluated ?? citations.length}
+                {sourceQuality != null && (
+                  <>
+                    {' '}
+                    · Primary {sourceQuality.primarySources} · Secondary{' '}
+                    {sourceQuality.secondarySources}
+                  </>
+                )}
+              </li>
+            )
+          })()}
           {calcPassed != null && (
             <li>Calculations validation: {calcPassed ? 'passed' : 'failed / incomplete'}</li>
           )}
