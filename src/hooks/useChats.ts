@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { Chat, Message, ModelId, QuickAction, StructuredAnswer, UserProfile } from '../types'
+import type {
+  Chat,
+  Message,
+  ModelId,
+  QuickAction,
+  ResponseMode,
+  StructuredAnswer,
+  StudyPreference,
+  UserProfile,
+} from '../types'
 import { streamAssistantReply, promptForAction } from '../lib/ai'
 import {
   loadActiveChatId,
@@ -13,12 +22,22 @@ import {
   titleFromPrompt,
   uid,
 } from '../lib/storage'
+import {
+  loadResponseMode,
+  loadStudyPreference,
+  saveResponseMode,
+  saveStudyPreference,
+} from '../study/persistence'
 
 export function useChats() {
   const [chats, setChats] = useState<Chat[]>(() => loadChats())
   const [activeChatId, setActiveChatId] = useState<string | null>(() => loadActiveChatId())
   const [model, setModelState] = useState<ModelId>(() => loadModel())
   const [user, setUserState] = useState<UserProfile>(() => loadUser())
+  const [responseMode, setResponseModeState] = useState<ResponseMode>(() => loadResponseMode())
+  const [studyPreference, setStudyPreferenceState] = useState<StudyPreference>(() =>
+    loadStudyPreference(),
+  )
   const [isStreaming, setIsStreaming] = useState(false)
   const [draft, setDraft] = useState('')
   const [statusLine, setStatusLine] = useState<string | null>(null)
@@ -52,6 +71,24 @@ export function useChats() {
     saveUser(next)
   }, [])
 
+  const setResponseMode = useCallback((next: ResponseMode) => {
+    setResponseModeState(next)
+    saveResponseMode(next)
+    setChats((prev) =>
+      prev.map((c) => (c.id === activeChatId ? { ...c, responseMode: next, updatedAt: Date.now() } : c)),
+    )
+  }, [activeChatId])
+
+  const setStudyPreference = useCallback((next: StudyPreference) => {
+    setStudyPreferenceState(next)
+    saveStudyPreference(next)
+    setChats((prev) =>
+      prev.map((c) =>
+        c.id === activeChatId ? { ...c, studyPreference: next, updatedAt: Date.now() } : c,
+      ),
+    )
+  }, [activeChatId])
+
   const createChat = useCallback((title = 'New chat') => {
     const chat: Chat = {
       id: uid('chat'),
@@ -59,16 +96,27 @@ export function useChats() {
       messages: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      responseMode,
+      studyPreference,
     }
     setChats((prev) => [chat, ...prev])
     setActiveChatId(chat.id)
     setDraft('')
     return chat
-  }, [])
+  }, [responseMode, studyPreference])
 
   const selectChat = useCallback((id: string) => {
     setActiveChatId(id)
     setDraft('')
+    const chat = loadChats().find((c) => c.id === id)
+    if (chat?.responseMode) {
+      setResponseModeState(chat.responseMode)
+      saveResponseMode(chat.responseMode)
+    }
+    if (chat?.studyPreference) {
+      setStudyPreferenceState(chat.studyPreference)
+      saveStudyPreference(chat.studyPreference)
+    }
   }, [])
 
   const goHome = useCallback(() => {
@@ -115,9 +163,10 @@ export function useChats() {
   )
 
   const sendMessage = useCallback(
-    async (raw: string) => {
+    async (raw: string, modeOverride?: ResponseMode) => {
       const content = raw.trim()
       if (!content || isStreaming) return
+      const mode = modeOverride ?? responseMode
 
       let chatId = activeChatId
       let workingMessages: Message[] = activeChat?.messages ?? []
@@ -133,6 +182,8 @@ export function useChats() {
         role: 'user',
         content,
         createdAt: Date.now(),
+        responseMode: mode,
+        studyPreference: mode === 'cpa_exam_study' ? studyPreference : undefined,
       }
 
       const assistantId = uid('msg')
@@ -141,6 +192,8 @@ export function useChats() {
         role: 'assistant',
         content: '',
         createdAt: Date.now(),
+        responseMode: mode,
+        studyPreference: mode === 'cpa_exam_study' ? studyPreference : undefined,
       }
 
       workingMessages = [...workingMessages, userMsg, assistantMsg]
@@ -152,6 +205,8 @@ export function useChats() {
                 ...c,
                 title: c.messages.length === 0 ? titleFromPrompt(content) : c.title,
                 messages: workingMessages,
+                responseMode: mode,
+                studyPreference: mode === 'cpa_exam_study' ? studyPreference : c.studyPreference,
                 updatedAt: Date.now(),
               }
             : c,
@@ -160,7 +215,11 @@ export function useChats() {
       setActiveChatId(chatId)
       setDraft('')
       setIsStreaming(true)
-      setStatusLine('Planning accounting workflow…')
+      setStatusLine(
+        mode === 'cpa_exam_study'
+          ? 'Preparing CPA study walkthrough…'
+          : 'Planning accounting workflow…',
+      )
 
       abortRef.current?.abort()
       const controller = new AbortController()
@@ -175,6 +234,33 @@ export function useChats() {
           historyForModel,
           controller.signal,
           (line) => setStatusLine(line),
+          {
+            mode,
+            studyPreference: mode === 'cpa_exam_study' ? studyPreference : undefined,
+            onResearchRun: (run) => {
+              setChats((prev) =>
+                prev.map((c) =>
+                  c.id === chatId
+                    ? {
+                        ...c,
+                        messages: c.messages.map((m) =>
+                          m.id === assistantId
+                            ? {
+                                ...m,
+                                structured: {
+                                  ...(m.structured ?? {}),
+                                  researchProcess: run,
+                                },
+                              }
+                            : m,
+                        ),
+                        updatedAt: Date.now(),
+                      }
+                    : c,
+                ),
+              )
+            },
+          },
         )) {
           if (event.type === 'text' && event.value) {
             setStatusLine(null)
@@ -199,7 +285,16 @@ export function useChats() {
         setStatusLine(null)
       }
     },
-    [activeChat, activeChatId, createChat, isStreaming, model, patchAssistant],
+    [
+      activeChat,
+      activeChatId,
+      createChat,
+      isStreaming,
+      model,
+      patchAssistant,
+      responseMode,
+      studyPreference,
+    ],
   )
 
   const startQuickAction = useCallback((action: QuickAction) => {
@@ -215,6 +310,10 @@ export function useChats() {
     setModel,
     user,
     setUser,
+    responseMode,
+    setResponseMode,
+    studyPreference,
+    setStudyPreference,
     draft,
     setDraft,
     isStreaming,

@@ -40,7 +40,8 @@ const ALLOWED_MIME = new Set([
   'application/octet-stream',
 ])
 
-export const MAX_UPLOAD_BYTES = 12 * 1024 * 1024
+/** Large enough for official USC title PDFs (e.g. Title 10 / Title 26). */
+export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 export function validateUpload(fileName: string, mimeType: string, size: number): void {
   const ext = path.extname(fileName).toLowerCase()
@@ -50,7 +51,7 @@ export function validateUpload(fileName: string, mimeType: string, size: number)
   if (mimeType && !ALLOWED_MIME.has(mimeType) && !mimeType.startsWith('text/')) {
     throw new Error(`Unsupported MIME type: ${mimeType}`)
   }
-  if (size > MAX_UPLOAD_BYTES) throw new Error('File exceeds maximum size (12MB).')
+  if (size > MAX_UPLOAD_BYTES) throw new Error('File exceeds maximum size (25MB).')
   if (/\.(exe|bat|cmd|ps1|js|mjs|cjs|sh|dll|com)$/i.test(fileName)) {
     throw new Error('Executable uploads are not allowed.')
   }
@@ -74,8 +75,32 @@ export class LocalDocumentProcessor implements DocumentProcessor {
       const { PDFParse } = await import('pdf-parse')
       const parser = new PDFParse({ data: buf })
       try {
-        const result = await parser.getText()
-        return { text: result?.text || '' }
+        const info = await parser.getInfo()
+        const total = info.total || 0
+        const pages: string[] = []
+
+        // Page batches — never build one giant joined string (blows past JS string limits on big USC vols).
+        const batchSize = 8
+        for (let start = 1; start <= total; start += batchSize) {
+          const partial: number[] = []
+          for (let p = start; p < start + batchSize && p <= total; p += 1) partial.push(p)
+          const result = await parser.getText({ partial })
+          for (const page of result.pages ?? []) {
+            const pageText = (page.text || '').replace(/\u0000/g, '').trim()
+            if (pageText) pages.push(pageText)
+          }
+        }
+
+        if (!pages.length && total === 0) {
+          const result = await parser.getText()
+          const fallback = (result?.text || '').replace(/\u0000/g, '')
+          return { text: fallback.slice(0, 2000), pages: fallback ? [fallback] : [] }
+        }
+
+        return {
+          text: pages.slice(0, 3).join('\n\n').slice(0, 2000),
+          pages,
+        }
       } finally {
         await parser.destroy().catch(() => undefined)
       }
@@ -101,38 +126,46 @@ export class LocalDocumentProcessor implements DocumentProcessor {
   }
 
   async chunk(document: ExtractedDocument, source: KnowledgeSource): Promise<DocumentChunk[]> {
-    const cleaned = document.text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
-    if (!cleaned) return []
     const size = 900
     const overlap = 120
     const chunks: DocumentChunk[] = []
-    let i = 0
     let index = 0
-    while (i < cleaned.length) {
-      const end = Math.min(i + size, cleaned.length)
-      const text = cleaned.slice(i, end).trim()
-      if (text) {
-        chunks.push({
-          id: uid('chunk'),
-          sourceId: source.id,
-          chunkIndex: index,
-          text,
-          page: Math.floor(index / 3) + 1,
-          section: source.topic || source.category,
-          paragraph: `p${index + 1}`,
-          headingHierarchy: [source.publisher, source.title].filter(Boolean),
-          applicableYear: source.taxYear,
-          jurisdiction: source.jurisdiction,
-          effectiveDate: source.effectiveDate,
-          authorityLevel: source.authorityLevel,
-          documentStatus: source.status,
-          startOffset: i,
-          endOffset: end,
-        })
-        index++
+
+    const segments =
+      document.pages && document.pages.length
+        ? document.pages
+        : [document.text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()].filter(Boolean)
+
+    for (let pageIdx = 0; pageIdx < segments.length; pageIdx += 1) {
+      const cleaned = segments[pageIdx].replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+      if (!cleaned) continue
+      let i = 0
+      while (i < cleaned.length) {
+        const end = Math.min(i + size, cleaned.length)
+        const text = cleaned.slice(i, end).trim()
+        if (text) {
+          chunks.push({
+            id: uid('chunk'),
+            sourceId: source.id,
+            chunkIndex: index,
+            text,
+            page: pageIdx + 1,
+            section: source.topic || source.category,
+            paragraph: `p${index + 1}`,
+            headingHierarchy: [source.publisher, source.title].filter(Boolean),
+            applicableYear: source.taxYear,
+            jurisdiction: source.jurisdiction,
+            effectiveDate: source.effectiveDate,
+            authorityLevel: source.authorityLevel,
+            documentStatus: source.status,
+            startOffset: i,
+            endOffset: end,
+          })
+          index += 1
+        }
+        if (end >= cleaned.length) break
+        i = Math.max(0, end - overlap)
       }
-      if (end >= cleaned.length) break
-      i = Math.max(0, end - overlap)
     }
     return chunks
   }

@@ -1,3 +1,16 @@
+import type {
+  EvidenceConfidenceResult,
+  SourceQualityResult,
+} from './scoring/schemas'
+import type {
+  CPAStudyResponse,
+  ResponseMode,
+  StudyPreference,
+} from './study/schemas'
+import type { ResearchRun } from './research/schemas'
+
+export type { EvidenceConfidenceResult, SourceQualityResult, CPAStudyResponse, ResponseMode, StudyPreference, ResearchRun }
+
 export type MessageRole = 'user' | 'assistant'
 
 export interface ScheduleRowView {
@@ -110,6 +123,12 @@ export interface AccountingResearchView {
   }
 }
 
+export interface QuickAnswerView {
+  answer: string
+  explanation?: string
+  mainSource?: string
+}
+
 export interface StructuredAnswer {
   assumptions?: string[]
   schedules?: ScheduleView[]
@@ -123,6 +142,16 @@ export interface StructuredAnswer {
   research?: AccountingResearchView
   missingFacts?: string[]
   toolTrace?: string[]
+  responseMode?: ResponseMode
+  studyPreference?: StudyPreference
+  cpaStudy?: CPAStudyResponse
+  quickAnswer?: QuickAnswerView
+  /** Deterministic evidence confidence snapshot for this response (immutable history). */
+  evidenceConfidence?: EvidenceConfidenceResult
+  /** Deterministic source quality snapshot for this response. */
+  sourceQuality?: SourceQualityResult
+  /** Full enforced research workflow run (stages, tools, passages, coverage). */
+  researchProcess?: ResearchRun
 }
 
 export interface Message {
@@ -131,6 +160,8 @@ export interface Message {
   content: string
   createdAt: number
   structured?: StructuredAnswer
+  responseMode?: ResponseMode
+  studyPreference?: StudyPreference
 }
 
 export interface Chat {
@@ -139,6 +170,8 @@ export interface Chat {
   messages: Message[]
   createdAt: number
   updatedAt: number
+  responseMode?: ResponseMode
+  studyPreference?: StudyPreference
 }
 
 export type QuickAction = 'depreciation' | 'journal_entries' | 'book_vs_tax' | 'authority'

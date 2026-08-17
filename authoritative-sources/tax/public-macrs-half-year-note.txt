@@ -1,0 +1,7 @@
+MACRS half-year convention (public teaching note)
+
+For many types of personal property, the half-year convention treats property as placed in service (or disposed of) in the middle of the year. That means a half-year of depreciation is generally allowed for the first year, regardless of when during the year the property is actually placed in service — unless the mid-quarter convention applies.
+
+The mid-quarter convention can apply when a disproportionate amount of depreciable personal property is placed in service during the last three months of the tax year. Always confirm the applicable tax year, property class, and any elections (such as section 179 or bonus depreciation) before computing an allowance.
+
+This file is a short Chai-maintained public teaching note for repository demos. Replace or supplement it with official IRS publications and other primary materials you are allowed to redistribute.

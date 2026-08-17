@@ -6,6 +6,7 @@ import cors from 'cors'
 import express from 'express'
 import multer from 'multer'
 import type { Message, ModelId } from '../src/types.ts'
+import type { ResponseMode, StudyPreference } from '../src/study/schemas.ts'
 import { runAccountingAgent } from './agent.ts'
 import {
   deleteDocument,
@@ -14,6 +15,8 @@ import {
   searchDocuments,
 } from './documents.ts'
 import { registerKnowledgeGovernanceRoutes } from './knowledgeGovernance.ts'
+import { appendResponseScoreSnapshot } from './studySnapshots.ts'
+import { syncAuthoritativeSourcesFromRepo } from './syncAuthoritativeSources.ts'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app = express()
@@ -124,6 +127,13 @@ app.post('/api/chat', async (req, res) => {
 
   const model = (req.body?.model as ModelId) || 'chai-1.0'
   const history = req.body?.history as Message[] | undefined
+  const modeRaw = String(req.body?.mode ?? 'professional')
+  const mode: ResponseMode =
+    modeRaw === 'cpa_exam_study' || modeRaw === 'quick_answer' || modeRaw === 'professional'
+      ? modeRaw
+      : 'professional'
+  const prefRaw = req.body?.studyPreference ? String(req.body.studyPreference) : undefined
+  const studyPreference = prefRaw as StudyPreference | undefined
 
   if (!Array.isArray(history) || history.length === 0) {
     res.status(400).json({ error: 'history must be a non-empty array of messages' })
@@ -137,6 +147,8 @@ app.post('/api/chat', async (req, res) => {
       role: m.role,
       content: String(m.content).slice(0, 20_000),
       createdAt: Number(m.createdAt) || Date.now(),
+      responseMode: m.responseMode,
+      studyPreference: m.studyPreference,
     }))
     .slice(-30)
 
@@ -146,7 +158,51 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    const result = await runAccountingAgent(safeHistory, model)
+    const wantsStream =
+      req.body?.stream === true || String(req.headers.accept || '').includes('text/event-stream')
+
+    if (wantsStream) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+      res.setHeader('Cache-Control', 'no-cache, no-transform')
+      res.setHeader('Connection', 'keep-alive')
+      res.flushHeaders?.()
+
+      const send = (event: string, data: unknown) => {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+      }
+
+      try {
+        const result = await runAccountingAgent(safeHistory, model, undefined, {
+          mode,
+          studyPreference,
+          onResearchProgress: async (ev) => {
+            send('research', ev)
+          },
+        })
+        await appendResponseScoreSnapshot({
+          structured: result.structured,
+          mode,
+          studyPreference,
+        }).catch(() => undefined)
+        send('result', result)
+        send('done', { ok: true })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Chat failed'
+        send('error', { error: message })
+      }
+      res.end()
+      return
+    }
+
+    const result = await runAccountingAgent(safeHistory, model, undefined, {
+      mode,
+      studyPreference,
+    })
+    await appendResponseScoreSnapshot({
+      structured: result.structured,
+      mode,
+      studyPreference,
+    }).catch(() => undefined)
     res.json(result)
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Chat failed'
@@ -171,4 +227,18 @@ app.listen(PORT, () => {
       ? 'OPENAI_API_KEY is set (kept on the server only).'
       : 'WARNING: OPENAI_API_KEY is missing. Add it to .env',
   )
+  void syncAuthoritativeSourcesFromRepo()
+    .then((r) => {
+      console.log(
+        `Authoritative sources sync: ${r.synced} updated, ${r.skipped} unchanged` +
+          (r.errors.length ? `, ${r.errors.length} error(s)` : ''),
+      )
+      for (const e of r.errors) console.warn('  -', e)
+    })
+    .catch((err) => {
+      console.warn(
+        'Authoritative sources sync failed:',
+        err instanceof Error ? err.message : err,
+      )
+    })
 })

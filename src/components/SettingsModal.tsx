@@ -8,9 +8,17 @@ interface SettingsModalProps {
   onClose: () => void
   onSave: (user: UserProfile) => void
   onClearChats: () => void
+  onOpenGovernance?: () => void
 }
 
-export function SettingsModal({ open, user, onClose, onSave, onClearChats }: SettingsModalProps) {
+export function SettingsModal({
+  open,
+  user,
+  onClose,
+  onSave,
+  onClearChats,
+  onOpenGovernance,
+}: SettingsModalProps) {
   const [name, setName] = useState(user.name)
   const [serverOk, setServerOk] = useState<boolean | null>(null)
   const [hasKey, setHasKey] = useState<boolean | null>(null)
@@ -93,6 +101,24 @@ export function SettingsModal({ open, user, onClose, onSave, onClearChats }: Set
             filing or booking entries.
           </p>
         </div>
+
+        {onOpenGovernance && (
+          <div className="disclaimer-box">
+            <strong>Knowledge Governance</strong>
+            <p>Upload and approve IRC / ASC / PCAOB and other authoritative sources (admin token required).</p>
+            <button
+              type="button"
+              className="btn-secondary"
+              style={{ marginTop: '0.65rem' }}
+              onClick={() => {
+                onClose()
+                onOpenGovernance()
+              }}
+            >
+              Open Knowledge Governance
+            </button>
+          </div>
+        )}
 
         <div className="modal-actions modal-actions-wrap">
           <button

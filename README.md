@@ -17,6 +17,14 @@ Admin-only area in the sidebar. Set `CHAI_ADMIN_TOKEN` in `.env`, paste the same
 - Unsupported conclusions are blocked
 - User **Files** remain separate and are never primary legal authority
 
+### Git-tracked authoritative documents
+
+Put official documents in **`authoritative-sources/`**, list each file in **`authoritative-sources/manifest.json`**, then commit and push.
+
+On server start, Chai syncs that folder into Knowledge Governance (approved + indexed).
+
+See `authoritative-sources/README.md` for the exact steps. You are responsible for licensing — do not push content you are not allowed to redistribute.
+
 ## Uploaded files
 
 Use **Files** in the sidebar (or the paperclip in chat) to upload PDF/TXT/MD/CSV/JSON.  

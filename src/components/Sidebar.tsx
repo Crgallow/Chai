@@ -66,8 +66,9 @@ export function Sidebar({
 
         <button type="button" className="files-link" onClick={onOpenGovernance}>
           <Shield size={15} />
-          Knowledge Governance
+          Knowledge
         </button>
+        <p className="sidebar-hint">Knowledge = IRC / ASC / PCAOB uploads</p>
 
         <div className="sidebar-section">
           <div className="sidebar-label">Recent chats</div>

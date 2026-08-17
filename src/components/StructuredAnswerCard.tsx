@@ -1,4 +1,7 @@
 import type { StructuredAnswer } from '../types'
+import { CPAStudyCard } from './CPAStudyCard'
+import { SourcesAndConfidence } from './SourcesAndConfidence'
+import { ResearchProcessPanel } from './ResearchProcessPanel'
 
 function money(n: number): string {
   return n.toLocaleString(undefined, { style: 'currency', currency: 'USD' })
@@ -6,9 +9,36 @@ function money(n: number): string {
 
 interface StructuredAnswerCardProps {
   structured: StructuredAnswer
+  chatId?: string
+  messageId?: string
+  prompt?: string
+  onExpandMode?: (mode: 'professional' | 'cpa_exam_study') => void
 }
 
-export function StructuredAnswerCard({ structured }: StructuredAnswerCardProps) {
+export function StructuredAnswerCard({
+  structured,
+  chatId,
+  messageId,
+  prompt,
+  onExpandMode,
+}: StructuredAnswerCardProps) {
+  if (structured.cpaStudy && structured.responseMode === 'cpa_exam_study') {
+    return (
+      <>
+        {structured.researchProcess && (
+          <ResearchProcessPanel run={structured.researchProcess} />
+        )}
+        <CPAStudyCard
+          study={structured.cpaStudy}
+          structured={structured}
+          chatId={chatId}
+          messageId={messageId}
+          prompt={prompt}
+        />
+      </>
+    )
+  }
+
   const hasBody =
     (structured.missingFacts?.length ?? 0) > 0 ||
     (structured.assumptions?.length ?? 0) > 0 ||
@@ -16,6 +46,9 @@ export function StructuredAnswerCard({ structured }: StructuredAnswerCardProps) 
     (structured.journalEntries?.length ?? 0) > 0 ||
     (structured.documentQuotes?.length ?? 0) > 0 ||
     Boolean(structured.research) ||
+    Boolean(structured.researchProcess) ||
+    Boolean(structured.quickAnswer) ||
+    Boolean(structured.evidenceConfidence) ||
     structured.reconciliation ||
     (structured.citations?.length ?? 0) > 0 ||
     (structured.toolTrace?.length ?? 0) > 0
@@ -24,6 +57,30 @@ export function StructuredAnswerCard({ structured }: StructuredAnswerCardProps) 
 
   return (
     <div className="structured-answer">
+      {structured.researchProcess && <ResearchProcessPanel run={structured.researchProcess} />}
+      {structured.quickAnswer && (
+        <section>
+          <h3>Quick answer</h3>
+          <p>
+            <strong>{structured.quickAnswer.answer}</strong>
+          </p>
+          {structured.quickAnswer.explanation && <p>{structured.quickAnswer.explanation}</p>}
+          {structured.quickAnswer.mainSource && (
+            <p className="field-hint">Main source: {structured.quickAnswer.mainSource}</p>
+          )}
+          {onExpandMode && (
+            <div className="study-toolbar">
+              <button type="button" className="text-btn" onClick={() => onExpandMode('professional')}>
+                Expand to Professional
+              </button>
+              <button type="button" className="text-btn" onClick={() => onExpandMode('cpa_exam_study')}>
+                Expand to CPA Exam Study
+              </button>
+            </div>
+          )}
+        </section>
+      )}
+
       {structured.missingFacts && structured.missingFacts.length > 0 && (
         <section>
           <h3>Missing facts</h3>
@@ -57,7 +114,11 @@ export function StructuredAnswerCard({ structured }: StructuredAnswerCardProps) 
             </p>
           ) : (
             <>
-              {structured.research.conclusion && <p><strong>Conclusion:</strong> {structured.research.conclusion}</p>}
+              {structured.research.conclusion && (
+                <p>
+                  <strong>Conclusion:</strong> {structured.research.conclusion}
+                </p>
+              )}
               {structured.research.explanation && <p>{structured.research.explanation}</p>}
             </>
           )}
@@ -75,12 +136,8 @@ export function StructuredAnswerCard({ structured }: StructuredAnswerCardProps) 
                 : ''}
             </li>
             <li>
-              Confidence: {structured.research.confidence.level} — {structured.research.confidence.reason}
-            </li>
-            <li>
-              Sufficiency score {structured.research.sourceSufficiency.score.toFixed(2)} (not a correctness
-              guarantee)
-              {structured.research.requiresProfessionalReview ? ' · Professional review recommended' : ''}
+              Advisory confidence label: {structured.research.confidence.level} —{' '}
+              {structured.research.confidence.reason}
             </li>
           </ul>
           {structured.research.factsReliedUpon.length > 0 && (
@@ -103,40 +160,6 @@ export function StructuredAnswerCard({ structured }: StructuredAnswerCardProps) 
                   </li>
                 ))}
               </ul>
-            </>
-          )}
-          {structured.research.citations.length > 0 && (
-            <>
-              <h4>Citations</h4>
-              <div className="citation-list">
-                {structured.research.citations.map((c, i) => (
-                  <article key={`${c.title}-${i}`} className="citation-chip">
-                    <header>
-                      <code>{c.internalOrExternal}</code>
-                      <span>
-                        {c.authorityLevel}
-                        {c.demoData ? ' · DEMO' : ''}
-                        {c.verified ? ' · verified' : ''}
-                      </span>
-                    </header>
-                    <strong>
-                      {c.publisher}: {c.title}
-                    </strong>
-                    {c.quotedText && <blockquote className="doc-quote">“{c.quotedText}”</blockquote>}
-                    {c.page != null && (
-                      <p className="field-hint">
-                        Location: page {c.page}
-                        {c.section ? ` · ${c.section}` : ''}
-                      </p>
-                    )}
-                    {c.sourceUrl && (
-                      <a href={c.sourceUrl} target="_blank" rel="noreferrer">
-                        Source
-                      </a>
-                    )}
-                  </article>
-                ))}
-              </div>
             </>
           )}
           {structured.research.warnings.length > 0 && (
@@ -324,6 +347,8 @@ export function StructuredAnswerCard({ structured }: StructuredAnswerCardProps) 
           </div>
         </section>
       )}
+
+      <SourcesAndConfidence structured={structured} />
 
       {structured.toolTrace && structured.toolTrace.length > 0 && (
         <details className="tool-trace">

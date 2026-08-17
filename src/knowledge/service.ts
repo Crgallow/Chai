@@ -13,6 +13,7 @@ import {
   deleteSourceRecord,
   getSource,
   listChunks,
+  listChunksForSource,
   listSources,
   replaceChunksForSource,
   uid,
@@ -361,6 +362,6 @@ export async function getVersionHistory(id: string): Promise<KnowledgeSource[]> 
 export async function previewSource(id: string): Promise<{ source: KnowledgeSource; chunkCount: number }> {
   const source = await getSource(id)
   if (!source) throw new Error('Source not found')
-  const chunks = (await listChunks()).filter((c) => c.sourceId === id)
+  const chunks = await listChunksForSource(id)
   return { source, chunkCount: chunks.length }
 }

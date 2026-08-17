@@ -18,7 +18,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 export const KG_ROOT = path.resolve(__dirname, '../../../data/knowledge-governance')
 export const KG_FILES = path.join(KG_ROOT, 'files')
 export const KG_SOURCES = path.join(KG_ROOT, 'sources.json')
+/** @deprecated Monolithic file — migrated to KG_CHUNKS_DIR. Kept for cleanup only. */
 export const KG_CHUNKS = path.join(KG_ROOT, 'chunks.json')
+export const KG_CHUNKS_DIR = path.join(KG_ROOT, 'chunks')
 export const KG_AUDIT = path.join(KG_ROOT, 'audit.json')
 export const KG_ALLOWLIST = path.join(KG_ROOT, 'allowlist.json')
 export const KG_EXTERNAL = path.join(KG_ROOT, 'external-candidates.json')
@@ -39,6 +41,12 @@ const DEFAULT_ALLOWLIST: DomainAllowlistEntry[] = [
 
 async function ensure(): Promise<void> {
   await fs.mkdir(KG_FILES, { recursive: true })
+  await fs.mkdir(KG_CHUNKS_DIR, { recursive: true })
+}
+
+function chunkFileForSource(sourceId: string): string {
+  const safe = sourceId.replace(/[^a-zA-Z0-9._-]+/g, '_')
+  return path.join(KG_CHUNKS_DIR, `${safe}.json`)
 }
 
 async function readJson<T>(file: string, fallback: T): Promise<T> {
@@ -89,23 +97,59 @@ export async function deleteSourceRecord(id: string): Promise<boolean> {
   const next = sources.filter((s) => s.id !== id)
   if (next.length === sources.length) return false
   await saveSources(next)
-  const chunks = await listChunks()
-  await saveChunks(chunks.filter((c) => c.sourceId !== id))
+  await fs.unlink(chunkFileForSource(id)).catch(() => undefined)
   return true
 }
 
-export async function listChunks(): Promise<DocumentChunk[]> {
-  const raw = await readJson<unknown[]>(KG_CHUNKS, [])
+export async function listChunksForSource(sourceId: string): Promise<DocumentChunk[]> {
+  const raw = await readJson<unknown[]>(chunkFileForSource(sourceId), [])
   return raw.map((r) => DocumentChunkSchema.parse(r))
 }
 
+export async function listChunks(): Promise<DocumentChunk[]> {
+  await ensure()
+  // Prefer per-source files. Ignore legacy monolithic chunks.json (too large to load safely).
+  let names: string[] = []
+  try {
+    names = (await fs.readdir(KG_CHUNKS_DIR)).filter((n) => n.endsWith('.json'))
+  } catch {
+    names = []
+  }
+  const out: DocumentChunk[] = []
+  for (const name of names) {
+    const raw = await readJson<unknown[]>(path.join(KG_CHUNKS_DIR, name), [])
+    for (const r of raw) out.push(DocumentChunkSchema.parse(r))
+  }
+  return out
+}
+
 export async function saveChunks(chunks: DocumentChunk[]): Promise<void> {
-  await writeJson(KG_CHUNKS, chunks)
+  const bySource = new Map<string, DocumentChunk[]>()
+  for (const chunk of chunks) {
+    const list = bySource.get(chunk.sourceId) ?? []
+    list.push(chunk)
+    bySource.set(chunk.sourceId, list)
+  }
+  await ensure()
+  // Clear existing per-source files then rewrite the provided set.
+  const existing = await fs.readdir(KG_CHUNKS_DIR).catch(() => [] as string[])
+  for (const name of existing) {
+    if (name.endsWith('.json')) {
+      await fs.unlink(path.join(KG_CHUNKS_DIR, name)).catch(() => undefined)
+    }
+  }
+  for (const [sourceId, list] of bySource) {
+    await writeJson(chunkFileForSource(sourceId), list)
+  }
 }
 
 export async function replaceChunksForSource(sourceId: string, chunks: DocumentChunk[]): Promise<void> {
-  const all = await listChunks()
-  await saveChunks([...all.filter((c) => c.sourceId !== sourceId), ...chunks])
+  await ensure()
+  if (!chunks.length) {
+    await fs.unlink(chunkFileForSource(sourceId)).catch(() => undefined)
+    return
+  }
+  await writeJson(chunkFileForSource(sourceId), chunks)
 }
 
 export async function appendAudit(partial: Omit<AuditRecord, 'id' | 'timestamp'> & { timestamp?: string }): Promise<AuditRecord> {

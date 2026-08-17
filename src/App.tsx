@@ -19,6 +19,10 @@ export default function App() {
     setModel,
     user,
     setUser,
+    responseMode,
+    setResponseMode,
+    studyPreference,
+    setStudyPreference,
     draft,
     setDraft,
     isStreaming,
@@ -97,6 +101,12 @@ export default function App() {
               messages={activeChat!.messages}
               isStreaming={isStreaming}
               statusLine={statusLine}
+              chatId={activeChat!.id}
+              onExpandMode={(mode) => {
+                setResponseMode(mode)
+                const lastUser = [...activeChat!.messages].reverse().find((m) => m.role === 'user')
+                if (lastUser) void sendMessage(lastUser.content, mode)
+              }}
             />
           )}
         </div>
@@ -113,6 +123,10 @@ export default function App() {
           onSend={sendMessage}
           model={model}
           onModelChange={setModel}
+          responseMode={responseMode}
+          onResponseModeChange={setResponseMode}
+          studyPreference={studyPreference}
+          onStudyPreferenceChange={setStudyPreference}
           disabled={isStreaming}
           onAttach={async (file) => {
             setUploadNote(`Indexing ${file.name}…`)
@@ -143,6 +157,10 @@ export default function App() {
         onClearChats={() => {
           clearAllChats()
           setSettingsOpen(false)
+        }}
+        onOpenGovernance={() => {
+          setSettingsOpen(false)
+          setGovernanceOpen(true)
         }}
       />
 

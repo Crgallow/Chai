@@ -60,7 +60,7 @@ describe('schemas', () => {
 describe('upload validation', () => {
   it('blocks executables and huge files', () => {
     expect(() => validateUpload('malware.exe', 'application/octet-stream', 10)).toThrow(/Unsupported extension|Executable/)
-    expect(() => validateUpload('a.pdf', 'application/pdf', 20 * 1024 * 1024)).toThrow(/maximum/)
+    expect(() => validateUpload('a.pdf', 'application/pdf', 30 * 1024 * 1024)).toThrow(/maximum/)
   })
 })
 

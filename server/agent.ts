@@ -1,13 +1,11 @@
-import OpenAI from 'openai'
-import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions'
-import {
-  DEPRECIATION_TOOL_DEFINITIONS,
-  executeTool,
-  finalizeCitations,
-  setDocumentSearchHandler,
-  setKnowledgeResearchHandler,
-} from '../src/accounting/tools.ts'
 import type { Message, ModelId, StructuredAnswer } from '../src/types.ts'
+import type { ResponseMode, StudyPreference } from '../src/study/schemas.ts'
+import { attachDeterministicScores } from '../src/scoring/attach.ts'
+import { buildMockAgentResult, snapshotScoreMeta } from '../src/study/index.ts'
+import { ensureCPAStudyStructured } from '../src/study/ensureStudy.ts'
+import { runAccountingResearchWorkflow } from './research/runResearch.ts'
+import type { ResearchProgressEvent, ResearchRun } from '../src/research/schemas.ts'
+import { setDocumentSearchHandler, setKnowledgeResearchHandler } from '../src/accounting/tools.ts'
 import { searchDocuments } from './documents.ts'
 import { runControlledResearch } from '../src/knowledge/researchPipeline.ts'
 import { seedDemoKnowledgeIfEmpty } from '../src/knowledge/mock/seed.ts'
@@ -51,24 +49,87 @@ setKnowledgeResearchHandler(async (question) => {
   }
 })
 
-const SYSTEM_PROMPT = `You are Chai, a professional accounting assistant with Knowledge Governance.
+function lastUserQuestion(history: Message[]): string {
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === 'user') return history[i].content
+  }
+  return history[history.length - 1]?.content ?? ''
+}
 
-Authority rules (mandatory):
-1. Never treat unrestricted internet content, model memory, or unsupported conclusions as authoritative accounting guidance.
-2. For accounting authority questions, call run_controlled_accounting_research first. It searches approved internal knowledge, evaluates sufficiency, and only then may use approved-domain official research (currently mock unless configured).
-3. If research returns unableToConclude, tell the user clearly that sufficient authoritative support was not found — do not guess.
-4. When official research was used, explicitly say that approved official websites were searched and label those sources as external.
-5. User Files (search_documents) are organization materials — never present them as primary legal/professional authority.
-6. Deterministic calculators must perform depreciation math and journal debit/credit validation.
-7. Only cite quotes returned by tools. Never fabricate citations.
-8. You are not a CPA.
+function structuredFromResearchRun(run: ResearchRun, content: string): StructuredAnswer {
+  const researchView =
+    run.primarySources.length || run.secondarySources.length || run.status === 'blocked'
+      ? {
+          conclusion: run.insufficientAuthority ? undefined : content.slice(0, 280),
+          explanation: content,
+          unableToConclude: run.insufficientAuthority || run.status === 'blocked',
+          requiresProfessionalReview: true,
+          usedMockRetrieval: run.usedMockProvider,
+          usedOfficialResearch: run.stages.some((s) =>
+            s.toolCalls.some((t) => t.name.includes('official')),
+          ),
+          officialResearchDisclosed: true,
+          confidence: {
+            level: run.insufficientAuthority ? ('low' as const) : ('medium' as const),
+            reason: 'Advisory only — evidence confidence is calculated separately.',
+          },
+          warnings: run.stages.flatMap((s) => s.warnings),
+          factsReliedUpon: run.facts?.userProvidedFacts ?? [],
+          assumptions: run.context?.assumptions.map((a) => a.statement) ?? [],
+          missingInformation: [
+            ...(run.facts?.potentiallyMissingFacts.map((m) => ({
+              field: m.field,
+              reason: m.reason,
+            })) ?? []),
+            ...(run.context?.missingMaterialFacts.map((m) => ({
+              field: m.field,
+              reason: m.reason,
+            })) ?? []),
+          ],
+          context: {
+            category: run.issues[0]?.category ?? 'unknown',
+            applicableYear: run.context?.taxYear,
+            jurisdiction: run.context?.jurisdiction,
+            accountingFramework: run.context?.accountingFramework,
+            auditFramework: run.context?.auditFramework,
+            bookOrTax: run.context?.bookOrTax,
+          },
+          citations: [...run.primarySources, ...run.secondarySources].map((s) => ({
+            publisher: s.publisher,
+            title: s.title,
+            authorityLevel: s.authorityType,
+            sourceType: s.primaryOrSecondary,
+            quotedText: s.exactPassage,
+            sourceUrl: s.sourceUrl,
+            page: s.page,
+            section: s.section,
+            internalOrExternal: (s.sourceUrl ? 'external' : 'internal') as 'internal' | 'external',
+            verified: s.verificationStatus === 'verified',
+            demoData: s.demoData,
+            applicableYear: s.applicableYear,
+          })),
+          sourceSufficiency: {
+            sufficient: !run.insufficientAuthority && run.status === 'completed',
+            score: run.citationCoverage?.passed ? 0.8 : 0.3,
+            deficiencies: run.citationCoverage?.uncitedConclusions ?? [],
+            reasons: [run.citationCoverage?.summary ?? ''],
+            requiresHumanReview: true,
+          },
+        }
+      : undefined
 
-Also available: compute_book_depreciation, compute_tax_depreciation, reconcile_book_tax, draft_journal_entry, lookup_authority, ask_missing_facts, search_documents.`
-
-function mapModel(model: ModelId): string {
-  if (model === 'chai-fast') return 'gpt-4o-mini'
-  if (model === 'chai-deep') return 'gpt-4o'
-  return 'gpt-4o-mini'
+  return snapshotScoreMeta(
+    attachDeterministicScores({
+      assumptions: run.context?.assumptions.map((a) => a.statement) ?? [],
+      missingFacts: [
+        ...(run.facts?.potentiallyMissingFacts.map((m) => m.field) ?? []),
+        ...(run.context?.missingMaterialFacts.map((m) => m.field) ?? []),
+      ],
+      research: researchView,
+      researchProcess: run,
+      toolTrace: run.stages.flatMap((s) => s.toolCalls.map((t) => `${s.stage}:${t.name}`)),
+    }),
+  )
 }
 
 export interface AgentResult {
@@ -76,80 +137,62 @@ export interface AgentResult {
   structured: StructuredAnswer
 }
 
+export interface AgentOptions {
+  mode?: ResponseMode
+  studyPreference?: StudyPreference
+  onResearchProgress?: (event: ResearchProgressEvent) => void | Promise<void>
+}
+
+/**
+ * Primary path: enforced accounting research state machine.
+ * Uses OpenAI Responses API (store:false) when OPENAI_API_KEY is set for structured stages.
+ */
 export async function runAccountingAgent(
   history: Message[],
   model: ModelId,
   signal?: AbortSignal,
+  options: AgentOptions = {},
 ): Promise<AgentResult> {
-  const apiKey = process.env.OPENAI_API_KEY?.trim()
-  if (!apiKey) {
+  const mode = options.mode ?? 'professional'
+  const studyPreference = options.studyPreference
+  const question = lastUserQuestion(history)
+
+  if (mode === 'cpa_exam_study' && !process.env.OPENAI_API_KEY?.trim()) {
+    const mock = buildMockAgentResult(history, mode, studyPreference)
     return {
-      content:
-        'The server is missing OPENAI_API_KEY. Add it to a local .env file (not the website). Restart the server after saving.',
-      structured: {
-        missingFacts: ['openai_api_key'],
-        assumptions: ['Server has no OpenAI key configured — tools were not run.'],
-      },
+      content: mock.content,
+      structured: snapshotScoreMeta({
+        ...mock.structured,
+        responseMode: mode,
+        studyPreference,
+      }),
     }
   }
 
-  const client = new OpenAI({ apiKey })
-  const structured: StructuredAnswer = { toolTrace: [], assumptions: [], citationIds: [] }
+  const { run, content } = await runAccountingResearchWorkflow({
+    question,
+    model,
+    signal,
+    responseMode: mode,
+    onProgress: options.onResearchProgress,
+  })
 
-  const messages: ChatCompletionMessageParam[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    ...history.map((m) => ({
-      role: m.role as 'user' | 'assistant',
-      content: m.content,
-    })),
-  ]
+  let structured = structuredFromResearchRun(run, content)
+  structured.responseMode = mode
+  structured.studyPreference = studyPreference
 
-  const maxIters = 8
-  for (let i = 0; i < maxIters; i++) {
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
-
-    const completion = await client.chat.completions.create(
-      {
-        model: mapModel(model),
-        messages,
-        tools: DEPRECIATION_TOOL_DEFINITIONS,
-        tool_choice: 'auto',
-        temperature: 0.2,
-      },
-      { signal },
-    )
-
-    const choice = completion.choices[0]?.message
-    if (!choice) throw new Error('Empty response from OpenAI')
-
-    messages.push(choice)
-
-    const toolCalls = choice.tool_calls
-    if (!toolCalls?.length) {
-      finalizeCitations(structured)
-      const content =
-        choice.content?.trim() ||
-        'I could not produce a final answer. Try providing cost, placed-in-service date, tax year, and book vs tax scope.'
-      return { content, structured }
-    }
-
-    for (const call of toolCalls) {
-      if (call.type !== 'function') continue
-      const label = `${call.function.name}(${call.function.arguments.slice(0, 120)})`
-      structured.toolTrace = [...(structured.toolTrace ?? []), label]
-      const result = await executeTool(call.function.name, call.function.arguments, structured)
-      messages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        content: result,
-      })
+  if (mode === 'cpa_exam_study') {
+    structured = snapshotScoreMeta(ensureCPAStudyStructured(structured, content, studyPreference))
+  }
+  if (mode === 'quick_answer') {
+    structured.quickAnswer = {
+      answer: content.split('\n').find((l) => l.trim())?.slice(0, 240) || content.slice(0, 240),
+      explanation: content.slice(0, 400),
+      mainSource: run.primarySources[0]
+        ? `${run.primarySources[0].publisher}: ${run.primarySources[0].title}`
+        : undefined,
     }
   }
 
-  finalizeCitations(structured)
-  return {
-    content:
-      'I hit the tool-call limit before finishing. Please retry with a more complete fact set (cost, PIS date, year, book/tax).',
-    structured,
-  }
+  return { content, structured }
 }
