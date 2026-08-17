@@ -4,10 +4,10 @@ import path from 'node:path'
 const ROOT = 'authoritative-sources'
 const MANIFEST_PATH = path.join(ROOT, 'manifest.json')
 
-function slugId(fileRel) {
+function slugId(fileRel, prefix) {
   const base = path.basename(fileRel, path.extname(fileRel))
   return (
-    'irs-' +
+    `${prefix}-` +
     base
       .toLowerCase()
       .replace(/\(rev\.[^)]*\)/gi, '')
@@ -16,6 +16,56 @@ function slugId(fileRel) {
       .slice(0, 80)
   )
 }
+
+function metaFor(rel) {
+  const top = rel.split('/')[0]
+  const name = path.basename(rel)
+  if (top === 'audit' || /pcaob|as\s+\d+/i.test(name)) {
+    const asMatch = name.match(/AS\s+(\d+)/i)
+    if (asMatch) {
+      return {
+        prefix: 'pcaob',
+        publisher: 'PCAOB',
+        category: 'audit',
+        authorityLevel: 'professional_standard',
+        auditFramework: 'PCAOB',
+        topic: 'PCAOB Auditing Standards',
+        subtopic: `AS ${asMatch[1]}`,
+        sourceUrl: 'https://pcaobus.org/oversight/standards/auditing-standards',
+      }
+    }
+    return {
+      prefix: 'audit',
+      publisher: /au-c|aicpa/i.test(name) ? 'AICPA' : 'PCAOB',
+      category: 'audit',
+      authorityLevel: 'professional_standard',
+      auditFramework: /au-c|aicpa/i.test(name) ? 'AICPA' : 'PCAOB',
+      topic: 'auditing standards',
+      sourceUrl: 'https://pcaobus.org/',
+    }
+  }
+  if (top === 'financial-accounting') {
+    return {
+      prefix: 'fa',
+      publisher: 'FASB / SEC',
+      category: 'financial_accounting',
+      authorityLevel: 'primary_authority',
+      accountingFramework: 'US_GAAP',
+      topic: 'financial accounting',
+      sourceUrl: 'https://www.fasb.org/',
+    }
+  }
+  return {
+    prefix: 'irs',
+    publisher: 'IRS',
+    category: 'tax',
+    authorityLevel: 'official_guidance',
+    accountingFramework: 'TAX',
+    topic: topicFor(name),
+    sourceUrl: 'https://www.irs.gov/forms-instructions',
+  }
+}
+
 
 function titleFor(fileRel) {
   const base = path.basename(fileRel, path.extname(fileRel))
@@ -63,7 +113,8 @@ const added = []
 for (const full of diskFiles.sort()) {
   const rel = path.relative(ROOT, full).split(path.sep).join('/')
   if (listed.has(rel)) continue
-  let id = slugId(rel)
+  const meta = metaFor(rel)
+  let id = slugId(rel, meta.prefix)
   if (usedIds.has(id)) {
     let i = 2
     while (usedIds.has(`${id}-${i}`)) i += 1
@@ -71,30 +122,29 @@ for (const full of diskFiles.sort()) {
   }
   usedIds.add(id)
   const name = path.basename(rel)
-  const isInstructions = /instruc/i.test(name)
   const entry = {
     id,
     file: rel,
-    publisher: 'IRS',
+    publisher: meta.publisher,
     title: titleFor(rel),
-    description: isInstructions
-      ? `IRS instructions PDF (${name}).`
-      : `IRS form/publication PDF (${name}).`,
+    description: `${meta.publisher} document (${name}).`,
     sourceType: 'authoritative',
-    category: 'tax',
-    authorityLevel: 'official_guidance',
+    category: meta.category,
+    authorityLevel: meta.authorityLevel,
     licensingStatus: 'public',
     jurisdiction: 'US-federal',
-    accountingFramework: 'TAX',
-    topic: topicFor(name),
-    sourceUrl: 'https://www.irs.gov/forms-instructions',
+    topic: meta.topic,
+    sourceUrl: meta.sourceUrl,
   }
+  if (meta.accountingFramework) entry.accountingFramework = meta.accountingFramework
+  if (meta.auditFramework) entry.auditFramework = meta.auditFramework
+  if (meta.subtopic) entry.subtopic = meta.subtopic
   manifest.sources.push(entry)
   added.push(entry.id)
 }
 
 manifest.description =
-  'Git-tracked authoritative corpus. USC titles, IRS Pub 17, IRS forms/instructions, plus curated notes.'
+  'Git-tracked authoritative corpus. USC titles, IRS forms/pubs, PCAOB/AICPA audit standards, plus curated notes.'
 
 fs.writeFileSync(MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`)
 console.log(`Added ${added.length} sources; total ${manifest.sources.length}`)
